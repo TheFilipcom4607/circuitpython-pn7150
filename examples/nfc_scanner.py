@@ -10,6 +10,8 @@ Reads are non-destructive: each tag is authenticated and read at most once, in
 one activation. (Mifare Classic will refuse a second authentication with a
 different key in the same tap, so probing "just to see" actively breaks the
 session and the NDEF read with it.)
+
+Copy this to CIRCUITPY/code.py to run it.
 """
 import board
 import digitalio

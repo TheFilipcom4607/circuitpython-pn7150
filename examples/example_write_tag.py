@@ -1,8 +1,11 @@
 """Write an NDEF message to a Type 2 tag (NTAG / Ultralight).
 
-This MODIFIES the tag. Pages 0-3 (UID, lock bits, capability container) are
-refused by the library, so the tag itself cannot be bricked by a bad page
-number, but the existing NDEF content is overwritten.
+This MODIFIES the tag. The library refuses pages 0-3 (UID, lock bits,
+capability container) and anything past the capacity the tag declares (the
+dynamic lock bytes, config and password pages), so a bad page number cannot
+brick the tag - but the existing NDEF content is overwritten.
+
+Copy this to CIRCUITPY/code.py to run it.
 """
 import board
 from pn7150 import PN7150, NDEFMessage, NDEFRecord, Type2Tag

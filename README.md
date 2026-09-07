@@ -18,7 +18,29 @@ cp pn7150.py /Volumes/CIRCUITPY/lib/
 ```
 
 Examples are in [`examples/`](examples): `nfc_scanner.py` is a scanner with
-NeoPixel feedback, `example_write_tag.py` writes NDEF to an NTAG.
+NeoPixel feedback, `example_write_tag.py` writes NDEF to an NTAG, and
+`badge_reader.py` matches a UID and waits for the badge to be lifted. Copy any
+of them to `CIRCUITPY/code.py`.
+
+### Wiring
+
+On the Challenger RP2040 NFC everything is already routed, so
+`PN7150.from_board(board)` is enough. On any other board:
+
+| PN7150 | Connect to | Notes |
+|---|---|---|
+| VDD | 3.3 V | not 5 V |
+| GND | GND | |
+| SCL | any I2C SCL pin | 4.7 kΩ pull-up to 3.3 V if the board has none |
+| SDA | any I2C SDA pin | same |
+| IRQ | any GPIO | the PN7150 drives this high when a frame is waiting |
+| VEN | any GPIO | active high; the driver pulses it to reset the chip |
+
+```python
+nfc = PN7150(board.GP5, board.GP4, irq=board.GP7, ven=board.GP6)
+```
+
+The `DWL_REQ` pin selects firmware-download mode. Leave it low or unconnected.
 
 ## Why not ElectronicCats_CircuitPython_PN7150
 
@@ -34,9 +56,11 @@ stops at "a tag was seen":
 | NDEF encoding / writing | none | `tag.write_ndef(...)` |
 | Type 2 read/write | raw `tag_cmd` only | `read`/`write`/`read_memory` |
 | Type 4 (DESFire) | none | APDUs + full NDEF flow |
-| Mifare Classic | none | authenticate + block reads |
+| Mifare Classic | none | authenticate, block read *and* write, NDEF |
 | ISO15693 | none | block reads + NDEF |
 | FeliCa / Type 3 | none | CHECK, attribute block, NDEF |
+| Type 4 / Type 5 NDEF writing | none | `write_ndef()` (unverified, see below) |
+| Presence / removal | none | `is_present()`, `wait_for_removal()` |
 | Errors | bare `assert` | `PN7150Error` hierarchy |
 | Timeouts | blocks forever | every wait takes `timeout=` |
 | Repeat suppression | none | tag reported once until removed |
@@ -52,6 +76,8 @@ Pass four pins and it builds its own 100 kHz bus, or pass `i2c=` to share one.
 * `scan(timeout=None, skip_repeats=True)` — generator yielding `Tag` objects.
 * `wait_for_tag(timeout=None)` — one tag, or `None` on timeout.
 * `start_discovery(technologies=...)` / `stop_discovery()` / `resume_discovery()`
+* `protocol_preference` — which protocol wins when one card offers several;
+  `candidates` lists what the last multi-protocol discovery saw
 * `debug = True` — print every NCI frame in both directions.
 
 Narrow the poll loop when you only care about one family:
@@ -67,22 +93,35 @@ nfc.start_discovery([TECH_NFC_A])
 * `type` — e.g. `"Type 2 (NTAG/Ultralight)"`
 * `technology_name`, `sens_res`, `sel_res`, `dsfid`
 * `ndef` — an `NDEFMessage` or `None`, read lazily and cached
-* `dump()` — everything, multi-line
+* `dump()` — everything, multi-line (touches `ndef`, so it blocks; `repr()` does not)
 * `transceive(data)` — raw command to the tag
+* `is_present()` — cheap poll: is the tag still on the antenna?
+* `wait_for_removal(timeout=None)` — block until it is lifted
+
+`is_present()` counts a refusal as present: a card that answers "access denied"
+is still a card in the field. Call it *before* finishing with the tag —
+`scan()` puts each tag to sleep on the way round the loop, and a sleeping tag
+reports absent. Pass `skip_repeats=False` when you mean to hold one there.
 
 Subclasses are chosen automatically: `Type2Tag`, `Type4Tag`,
 `MifareClassicTag`, `Type5Tag`, `Type3Tag`.
 
+Writes are bounded by whatever capacity the tag declares in its capability
+container, so a message that does not fit raises `NDEFError` instead of running
+off the end of user memory into the lock bytes and config pages:
+
 ```python
 if isinstance(tag, Type2Tag):
     tag.write_ndef(NDEFMessage.from_uri("https://example.com"))
+    tag.write(8, b"\x00\x00\x00\x00")   # ValueError past the last data page
 elif isinstance(tag, MifareClassicTag):
     tag.authenticate(1, KEY_NDEF)
     print(tag.read_block(4))
+    tag.write_block(4, bytes(16))        # sector trailers refused
 elif isinstance(tag, Type4Tag):
     data, sw = tag.apdu(b"\x00\xa4\x04\x00\x07\xd2\x76\x00\x00\x85\x01\x01\x00")
 elif isinstance(tag, Type5Tag):
-    print(tag.capability_container)
+    print(tag.capability_container, tag.capacity)
 elif isinstance(tag, Type3Tag):
     print(tag.idm, tag.pmm, tag.has_ndef_service())
 ```
@@ -93,6 +132,8 @@ elif isinstance(tag, Type3Tag):
 msg = NDEFMessage.from_uri("https://example.com")
 msg = NDEFMessage.from_text("hello", "en")
 msg = NDEFMessage([NDEFRecord.uri("https://a.co"), NDEFRecord.text("caption")])
+msg = NDEFMessage([NDEFRecord.mime("application/cbor", data),
+                   NDEFRecord.external("example.com:widget", b"\x01")])
 
 msg.uri, msg.text, msg.value      # first matching record
 for rec in msg:
@@ -100,6 +141,9 @@ for rec in msg:
     rec.value     # str for uri/text, bytes otherwise
     rec.language  # text records only
 ```
+
+Records and messages compare by value, so a round trip can be asserted
+directly: `NDEFMessage.from_bytes(msg.to_bytes()) == msg`.
 
 All 36 URI prefix codes are handled, so `tel:+48…` and `https://…` both
 round-trip to their short form on the tag.
@@ -109,6 +153,13 @@ round-trip to their short form on the tag.
 `PN7150Error` is the base. `NotConnectedError`, `CommandError`, `TagLostError`,
 `TagTimeoutError`, `NotSupportedError`, `NDEFError`. Reading `tag.ndef` never
 raises — it returns `None` if the tag holds no NDEF or the read fails.
+
+`CommandError.status` carries the NCI status byte when there was one, so a
+caller can tell a transient RF glitch (`TRANSIENT_STATUSES`, retried
+automatically on reads) from a refusal like `0x03`.
+
+The predicates answer rather than raise: `has_ndef_service()` and
+`select_ndef_application()` return `False` for a card that stays silent.
 
 ## Hardware notes
 
@@ -147,30 +198,149 @@ Other things worth knowing, all learned the hard way:
   turns a benign "already polling" into a fatal error.
 * A FeliCa card without an NDEF service answers CHECK with SF2 `0xA6`. That is
   the normal answer from transit and payment cards, not a fault.
+* **`0xFE` terminates a TLV area only between TLVs.** Inside a binary payload
+  it is ordinary data, so a read that stops at the first `0xFE` truncates any
+  message containing one. The declared TLV length is the only safe bound.
+* **Never write past the capacity the CC declares.** On an NTAG the next pages
+  are the dynamic lock bytes, AUTH0 and the password — a stray write there can
+  lock a tag read-only for good. `write()` refuses them unless `force=True`.
+* Mifare Classic 4K is not 1K with more blocks: sectors 0–31 hold 4 blocks,
+  32–39 hold 16, and block 64 is MAD2 rather than data.
+* **A card that offers two protocols is not activated automatically.** When one
+  target matches several protocols — `SAK 0x28` advertises both ISO-DEP and
+  Mifare Classic, which is what MIFARE Plus SL1 and the UID-changeable "magic"
+  clones report — the NFCC sends one `RF_DISCOVER_NTF` per candidate and waits
+  in `W4_HOST_SELECT` for an `RF_DISCOVER_SELECT`. Ignoring those notifications
+  hangs the read *and* leaves the controller in a non-polling state, so every
+  later tag is invisible too. `protocol_preference` decides which one is taken.
+* **`CORE_INTERFACE_ERROR_NTF` (`60 08`) is the answer, not noise.** Cards that
+  ignore an APDU make the NFCC report `RF_TIMEOUT_ERROR` immediately; treating
+  that as an uninteresting notification means waiting out the caller's whole
+  timeout and then reporting something vaguer than what the chip already said.
+  Payload is `<status> <conn id>`; `60 07` carries `<status>` alone.
+* **A Type 5 CC is 4 bytes or 8.** Once the T5T area passes 2040 bytes, MLEN no
+  longer fits in one byte: byte 2 is zeroed, a 16-bit MLEN moves to bytes 6–7,
+  and the NDEF area therefore starts at block 2 rather than block 1. Assuming
+  the short form reads half the CC as TLV data and writes over the CC itself.
+* **Transient RF errors are normal.** `RF_FRAME_CORRUPTED` mid-read is what a
+  tag held at the edge of the field produces; abandoning the read on the first
+  one loses the whole message. Reads retry (`READ_ATTEMPTS`) on the four
+  transient statuses, while a flat refusal (`0x03`) still fails at once.
+* Not every tag answers `READ` of page 3 with four pages — one here returns a
+  single byte — so a capability container must never be indexed unchecked.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `TagTimeoutError` from `connect()` | Bus too fast, or no I2C pull-ups. The driver defaults to 100 kHz; check the wiring table above. |
+| `connect()` works, no tag is ever seen | IRQ and VEN swapped, or VEN wired to a pin that idles high. |
+| Reader goes blind after the first tag | Something called `stop_discovery()` without `start_discovery()`. `resume_discovery()` handles the `W4_HOST_SELECT` dance for you. |
+| `CommandError ... status 0x03` on Mifare | Wrong key, or a *second* authentication in one tap. Lift the tag and re-present it. |
+| The same tag is reported over and over | `skip_repeats=False`. That is the deliberate setting for `badge_reader.py`. |
+| `tag.ndef` is `None` on a tag you know holds data | Turn on `debug=True` and look at the frames; for Mifare, the data may live under a key other than `KEY_NDEF`. |
+
+## Known limitations
+
+* **No tag formatting.** `MifareClassicTag.write_ndef()` fills in a card that
+  is *already* NDEF-formatted; it will not create the MAD or set the NDEF key,
+  because that means writing sector trailers and a trailer with the wrong
+  access bits locks its sector permanently. Sector trailers are refused unless
+  you pass `force=True`.
+* **No NCI segmentation.** One packet carries at most 255 bytes, and payloads
+  over that raise `ValueError` rather than being split.
+* Pages 0–3 of a Type 2 tag are never written, so a factory-blank tag with no
+  capability container is not made NDEF-ready.
+* **No Mifare MAD parsing.** `read_ndef()` walks the sectors under the NFC
+  Forum key rather than consulting the application directory.
+* **Reader/writer mode only.** No card emulation, no peer-to-peer.
+* **`wait_for_tag()` busy-waits on the IRQ pin**, so it does not cooperate with
+  `asyncio`. Poll with a short `timeout=` if you need to share the CPU.
 
 ## Verified on hardware
 
-Against a Challenger RP2040 NFC with tags emulated by a Flipper Zero:
+A Challenger RP2040 NFC against 20 tags spanning all four RF technologies,
+some real and some emulated by a Flipper Zero, with every NCI frame logged:
 
 | Tag | Result |
 |---|---|
-| NTAG/Ultralight | `https://thefilip.com` |
-| Mifare Classic 1K | `tel:+48...` (auth + NDEF) |
-| Mifare Classic (foreign keys) | clean `CommandError`, status `0x03` |
-| ISO15693 | `https://3dtag.org/s/...` + a CBOR MIME record |
-| DESFire | identified; no NDEF application present |
-| FeliCa (transit card) | IDm/PMm read, CHECK answered, NDEF service correctly reported absent |
+| NTAG213 (144 B) | `https://thefilip.com`; CC, capacity and page bounds correct |
+| NTAG215 (496 B) | text record `"Lorem ipsum"` |
+| Mifare Classic 1K | `KEY_NDEF` auth + NDEF read |
+| Mifare Classic ×4 | clean `CommandError` `0x03` under a key the card does not use |
+| Mifare Classic (`SAK 0x28`) | multi-protocol; selected and activated as Mifare |
+| ISO15693 (312 B) | `https://3dtag.org/…` + a CBOR MIME record, 303 bytes, 2 records |
+| ISO15693 (unformatted) | no magic number, reported as capacity 0, no NDEF |
+| ISO-DEP ×6 | no NDEF application, reported cleanly and immediately |
+| DESFire (random UID) | identified, `0x08` prefix flagged as regenerated per tap |
+| FeliCa (transit) | IDm/PMm read, NDEF service correctly reported absent |
 
-A final 22-tag run across all four technologies produced no read failures.
+`is_present()` and `wait_for_removal()` were exercised on every one of them.
 
-The one path not proven against real hardware is reading NDEF *from* a FeliCa
-card — no FeliCa carrying NDEF was available, so `Type3Tag.read_ndef()` is
-verified only against a synthetic card. Writing NDEF (`Type2Tag.write_ndef`)
-is likewise implemented and guarded but untested on a physical tag.
+Writing was then verified end to end against an NTAG215 and a MIFARE Classic
+1K, each time by saving the tag's existing message, writing, reading back,
+comparing, and restoring the original:
 
-`test_pn7150.py` holds 51 assertions that run **on the board**, since
-CPython-only constructs (`0xFE in bytearray`, `[::-1]`) pass a desktop syntax
-check and then fail on CircuitPython. Copy it to `code.py` to run them.
+| Write path | Result |
+|---|---|
+| `Type2Tag.write_ndef()` | single and multi-record round trips; both guards fire |
+| `MifareClassicTag.write_block()` | two-phase write, read back, restored |
+| `MifareClassicTag.write_ndef()` | round trip and restore under `KEY_NDEF` |
+
+Five bugs were found by that run and are fixed, each with a regression test
+built from the captured frames: multi-protocol targets hanging the reader, a
+single corrupted frame destroying a 303-byte message, `has_ndef_service()` and
+`select_ndef_application()` raising instead of answering, and the controller's
+own error notifications being ignored.
+
+### Not proven on hardware
+
+Implemented and guarded, but no suitable tag was available. Treat these as the
+parts most likely to still have a bug:
+
+| Path | Why untested |
+|---|---|
+| `Type4Tag.write_ndef()`, `update_binary()` | no writable Type 4 tag |
+| `Type5Tag.write_block()`, `write_ndef()` | no writable ISO15693 tag |
+| 8-byte Type 5 capability container | no tag over 2040 bytes; unit-tested only |
+| Mifare Classic 4K geometry | no 4K card; the sector maths is unit-tested |
+| `Type3Tag.read_ndef()` | no FeliCa carrying NDEF; synthetic card only |
+
+## Tests
+
+`test_pn7150.py` holds 110 assertions and is written to run **on the board** —
+copy it to `code.py`. That matters because CPython-only constructs
+(`0xFE in bytearray`, `[::-1]`) pass a desktop syntax check and then fail on
+CircuitPython.
+
+The same file also runs on the desktop. `tests/stubs/` supplies just enough of
+`busio`, `digitalio`, `supervisor` and `micropython` for the pure-logic paths,
+`tests/test_device_suite.py` executes the on-device suite under them, and
+`tests/test_regressions.py` pins the bugs that have been fixed so far. CI runs
+both on every push:
+
+```bash
+pip install -e ".[dev]" && pytest
+```
+
+A green desktop run is necessary, not sufficient — the on-device run is still
+the one that counts. `CommandError.__init__` calling `PN7150Error.__init__`
+shipped once and passed every desktop test: CircuitPython's native exception
+types expose no Python-level `__init__`, so only the board caught it.
+
+On a RAM-tight board the driver's source plus a large script may not fit —
+CircuitPython compiles source into RAM at import, and on an RP2040 the two
+together overflow it. Two tools deal with that, and neither changes behaviour:
+
+```bash
+python tools/minify.py pn7150.py build/pn7150.py     # ~38% smaller
+python tools/split_tests.py test_pn7150.py build/    # suite -> 5 runnable parts
+```
+
+`minify.py` is an `ast.unparse` round trip that drops docstrings and comments;
+the stripped module passes the identical test suite. `split_tests.py` packs the
+on-device suite into parts that each fit, since the whole thing no longer does.
+All 110 assertions pass on a Challenger RP2040 NFC that way.
 
 ## License and credits
 
