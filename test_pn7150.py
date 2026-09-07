@@ -191,5 +191,225 @@ check("0xB2 is RF_TIMEOUT_ERROR",
 check("felica SF2 0xA6 decoded",
       pn7150._felica_error(0xA6), "service not present on this card")
 
+print("--- regressions (these all shipped broken once) ---")
+# A formatted but empty tag holds `03 00 FE`. That is an empty message, not a
+# malformed one, and finding it should cost one read, not a whole memory dump.
+check("empty TLV reads as none", pn7150._ndef_from_tlv(b"\x03\x00\xfe" + bytes(10)), None)
+_reads = []
+def _blank_read(page):
+    _reads.append(page)
+    image = b"\x03\x00\xfe" + bytes(501)
+    return image[(page - 4) * 4:(page - 4) * 4 + 16]
+check("blank tag stops at terminator", pn7150._read_ndef_area(_blank_read, 4, 4, 504), None)
+check("...in one read", len(_reads), 1)
+
+# 0xFE is a TLV terminator only between TLVs. Inside a binary payload it is
+# ordinary data, and scanning for it truncated any message that contained one.
+check("tlv end: need more", pn7150._ndef_tlv_end(b"\x03"), pn7150.TLV_NEED_MORE)
+check("tlv end: terminator", pn7150._ndef_tlv_end(b"\xfe"), pn7150.TLV_NO_NDEF)
+check("tlv end: real tag", pn7150._ndef_tlv_end(b"\x01\x03\xa0\x0c\x34\x03\x11"), 24)
+check("tlv end: 3-byte form", pn7150._ndef_tlv_end(b"\x03\xff\x01\x00"), 4 + 256)
+
+_payload = bytes([0xFE if i in (30, 31) else i % 251 for i in range(200)])
+_tlv = pn7150._ndef_to_tlv(NDEFMessage([NDEFRecord.mime("application/cbor", _payload)]))
+_image = _tlv + bytes(512)
+_blocks = {}
+_off, _blk = 0, 4
+while _off < len(_image):
+    if _blk % 4 == 3:
+        _blk += 1
+        continue
+    _blocks[_blk] = _image[_off:_off + 16]
+    _off += 16
+    _blk += 1
+
+class FakeMifare(pn7150.MifareClassicTag):
+    def __init__(self):
+        Tag.__init__(self, FakeNFC(), 0, 1, pn7150.PROTOCOL_MIFARE, TECH_NFC_A,
+                     b"\x44\x00\x04\x01\x02\x03\x04\x01\x08")
+    def authenticate(self, sector, key=None, key_b=False):
+        return True
+    def read_block(self, block):
+        return _blocks.get(block, bytes(16))
+
+check("0xFE in a payload is not a terminator",
+      FakeMifare().read_ndef().records[0].payload, _payload)
+
+mfc = pn7150.MifareClassicTag
+check("4K sector of block 128", mfc.sector_of(128), 32)
+check("4K sector of block 144", mfc.sector_of(144), 33)
+check("4K first block of sector 33", mfc.first_block_of(33), 144)
+check("4K trailer is block 143", mfc.is_trailer(143), True)
+check("4K block 142 is data", mfc.is_trailer(142), False)
+
+# Writing past the declared capacity lands in the lock bytes and config pages.
+class BoundedT2(Type2Tag):
+    def __init__(self):
+        Tag.__init__(self, FakeNFC(), 0, 1, 2, TECH_NFC_A,
+                     b"\x44\x00\x04\x01\x02\x03\x04\x01\x00")
+        self.sent = []
+    def read(self, page):
+        if page == 3:
+            return b"\xe1\x10\x06\x00" + bytes(12)   # MLEN 6 -> 48 bytes
+        return bytes(16)
+    def transceive(self, data, timeout=0.5):
+        self.sent.append(bytes(data))
+        return b"\x00"
+
+check("capacity from CC", BoundedT2().capacity, 48)
+check("last data page", BoundedT2().last_data_page, 15)
+_t = BoundedT2()
+check_raises("refuses a message larger than the tag",
+             lambda: _t.write_ndef(NDEFMessage([NDEFRecord.mime("application/x", bytes(400))])),
+             pn7150.NDEFError)
+check("nothing was written first", _t.sent, [])
+check_raises("refuses the first config page",
+             lambda: BoundedT2().write(16, b"\x00\x00\x00\x00"), ValueError)
+check_raises("force never lifts the lower bound",
+             lambda: BoundedT2().write(0, b"\x00\x00\x00\x00", True), ValueError)
+check("force lifts the upper bound",
+      BoundedT2().write(40, b"\x00\x00\x00\x00", True), True)
+
+check_raises("oversized NCI payload is a clear error",
+             lambda: Tag(FakeNFC(), 0, 1, 2, TECH_NFC_A, b"\x44\x00\x00",
+                         max_payload=32).transceive(bytes(33)), ValueError)
+
+# CircuitPython native exceptions have no Python-level __init__, so a subclass
+# that calls PN7150Error.__init__(self, msg) raises AttributeError here while
+# passing on CPython. This check exists because that shipped once.
+_e = pn7150.CommandError("boom", 0x02)
+check("CommandError keeps its message", str(_e), "boom")
+check("CommandError carries status", _e.status, 0x02)
+check("CommandError status defaults", pn7150.CommandError("plain").status, None)
+try:
+    raise pn7150.CommandError("thrown", 0xB2)
+except pn7150.PN7150Error as _caught:
+    check("status survives raise/catch", _caught.status, 0xB2)
+try:
+    pn7150._split_status(bytes(4) + b"\x02", "read")
+    check("split_status raises", False, True)
+except pn7150.CommandError as _e2:
+    check("split_status status is 0x02", _e2.status, 0x02)
+check("transient status is retried", pn7150._is_transient(
+    pn7150.CommandError("x", 0x02)), True)
+check("refusal is not retried", pn7150._is_transient(
+    pn7150.CommandError("x", 0x03)), False)
+
+print("--- new API ---")
+_ext = NDEFRecord.external("example.com:widget", b"\x01\x02")
+_back = NDEFMessage.from_bytes(NDEFMessage([_ext]).to_bytes())
+check("external kind", _back.records[0].kind, "external")
+check("external type", _back.records[0].type, b"example.com:widget")
+check("external value", _back.records[0].value, b"\x01\x02")
+
+check("records compare by value",
+      NDEFRecord.uri("https://a.co") == NDEFRecord.uri("https://a.co"), True)
+check("unequal records differ",
+      NDEFRecord.uri("https://a.co") != NDEFRecord.uri("https://b.co"), True)
+_multi = NDEFMessage([NDEFRecord.uri("https://a.co"), NDEFRecord.text("x", "sv")])
+check("message survives a round trip intact",
+      NDEFMessage.from_bytes(_multi.to_bytes()) == _multi, True)
+check("message vs non-message", NDEFMessage.from_text("hi") == "hi", False)
+
+class RefusingTag(Type2Tag):
+    def __init__(self):
+        Tag.__init__(self, FakeNFC(), 0, 1, 2, TECH_NFC_A, b"\x44\x00\x00")
+    def transceive(self, data, timeout=0.5):
+        raise pn7150.CommandError("refused")
+
+class GoneTag(RefusingTag):
+    def transceive(self, data, timeout=0.5):
+        raise pn7150.TagLostError("gone")
+
+check("a refusal still proves presence", RefusingTag().is_present(), True)
+check("a lost tag is absent", GoneTag().is_present(), False)
+
+class FakeT5(pn7150.Type5Tag):
+    CC = {0: b"\xe1\x40\x27\x01"}
+    def __init__(self):
+        Tag.__init__(self, FakeNFC(), 0, 1, 6, TECH_NFC_V, b"\x00\x00" + bytes(8))
+    def read_block(self, block):
+        if block not in self.CC:
+            raise pn7150.CommandError("no block %d" % block, 0x03)
+        return self.CC[block]
+
+class FakeT5Long(FakeT5):
+    CC = {0: b"\xe2\x40\x00\x01", 1: b"\x00\x00\x03\x20"}
+check_raises("Type 5 refuses to overwrite the CC",
+             lambda: FakeT5().write_block(0, b"\x00\x00\x00\x00"), ValueError)
+check_raises("Type 5 block is exactly 4 bytes",
+             lambda: FakeT5().write_block(1, b"\x00\x00"), ValueError)
+# An 8-byte CC (byte 2 == 0) puts a 16-bit MLEN in bytes 6-7 and moves the
+# T5T area to block 2. Parsing it as the short form reads half the CC as TLV.
+check("short CC size", FakeT5().cc_size, 4)
+check("short CC capacity", FakeT5().capacity, 312)
+check("short CC first data block", FakeT5().first_data_block, 1)
+check("long CC size", FakeT5Long().cc_size, 8)
+check("long CC capacity", FakeT5Long().capacity, 0x0320 * 8)
+check("long CC first data block", FakeT5Long().first_data_block, 2)
+check_raises("long CC protects block 1",
+             lambda: FakeT5Long().write_block(1, b"\x00\x00\x00\x00"), ValueError)
+
+print("--- Mifare Classic writing ---")
+_sent = []
+_mem = {}
+class FakeWritableMFC(pn7150.MifareClassicTag):
+    def __init__(self, sak=0x08):
+        Tag.__init__(self, FakeNFC(), 0, 1, pn7150.PROTOCOL_MIFARE, TECH_NFC_A,
+                     bytes([0x04, 0x00, 0x04, 1, 2, 3, 4, 0x01, sak]))
+        self._pending = None
+    def authenticate(self, sector, key=None, key_b=False):
+        return True
+    def read_block(self, block):
+        return _mem.get(block, bytes(16))
+    def transceive(self, data, timeout=0.5):
+        data = bytes(data)
+        _sent.append(data)
+        if len(data) == 3 and data[1] == 0xA0:
+            self._pending = data[2]
+            return b"\x00\x00\x00"
+        if len(data) == 17 and data[0] == 0x10:
+            _mem[self._pending] = data[1:]
+            return b"\x00\x00"
+        return b"\x00"
+
+# NXP's reference does the write in two exchanges: the command is acked
+# before the 16 data bytes are sent.
+_t = FakeWritableMFC()
+_t.write_block(4, bytes(range(16)))
+check("mfc write phase 1 frame", hexlify(_sent[0]), "10:a0:04")
+check("mfc write phase 2 frame", hexlify(_sent[1]),
+      "10:" + hexlify(bytes(range(16))))
+check("mfc write landed", _mem[4], bytes(range(16)))
+
+check_raises("mfc refuses the manufacturer block",
+             lambda: FakeWritableMFC().write_block(0, bytes(16)), ValueError)
+check_raises("mfc refuses a sector trailer",
+             lambda: FakeWritableMFC().write_block(3, bytes(16)), ValueError)
+check_raises("mfc refuses a trailer high up too",
+             lambda: FakeWritableMFC().write_block(63, bytes(16)), ValueError)
+check("mfc trailer write needs force",
+      FakeWritableMFC().write_block(7, bytes(16), True), True)
+check_raises("mfc block is exactly 16 bytes",
+             lambda: FakeWritableMFC().write_block(4, bytes(4)), ValueError)
+
+check("mfc ndef blocks skip MAD and trailers",
+      FakeWritableMFC().ndef_blocks()[:4], [4, 5, 6, 8])
+check("mfc 1K ndef capacity", FakeWritableMFC().ndef_capacity, 45 * 16)
+check("mfc 4K skips MAD2",
+      64 in FakeWritableMFC(0x18).ndef_blocks(), False)
+
+_sent = []
+_mem = {}
+_msg = NDEFMessage([NDEFRecord.uri("https://example.com"),
+                    NDEFRecord.text("hello", "en")])
+_t2 = FakeWritableMFC()
+_t2.write_ndef(_msg)
+check("mfc write_ndef round trips", _t2.read_ndef() == _msg, True)
+check_raises("mfc refuses an oversized message",
+             lambda: FakeWritableMFC().write_ndef(NDEFMessage(
+                 [NDEFRecord.mime("application/x", bytes(45 * 16))])),
+             pn7150.NDEFError)
+
 print()
 print("%d passed, %d failed" % (passed, failed))

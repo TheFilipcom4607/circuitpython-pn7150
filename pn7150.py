@@ -30,7 +30,7 @@ from supervisor import ticks_ms
 from digitalio import DigitalInOut, Pull
 import busio
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 
 _TICKS_PERIOD = const(1 << 29)
 
@@ -46,7 +46,18 @@ class NotConnectedError(PN7150Error):
 
 
 class CommandError(PN7150Error):
-    """The controller rejected a command or answered unexpectedly."""
+    """The controller rejected a command or answered unexpectedly.
+
+    :attr:`status` is the NCI status byte when there was one, so a caller can
+    tell a transient RF glitch from a flat refusal.
+    """
+
+    def __init__(self, message, status=None):
+        # super(), not PN7150Error.__init__: CircuitPython's native exception
+        # types expose no Python-level __init__, so the unbound call raises
+        # AttributeError on the board while passing fine on CPython.
+        super().__init__(message)
+        self.status = status
 
 
 class TagLostError(PN7150Error):
@@ -138,6 +149,10 @@ STATUS_NAMES = {
     0xB1: "RF_PROTOCOL_ERROR",
     0xB2: "RF_TIMEOUT_ERROR",
     0xB3: "RF_UNEXPECTED_DATA",
+    0xC0: "NFCEE_INTERFACE_ACTIVATION_FAILED",
+    0xC1: "NFCEE_TRANSMISSION_ERROR",
+    0xC2: "NFCEE_PROTOCOL_ERROR",
+    0xC3: "NFCEE_TIMEOUT_ERROR",
 }
 
 STATUS_DISCOVERY_ALREADY_STARTED = const(0xA0)
@@ -239,6 +254,17 @@ class NDEFRecord:
             val = hexlify(val[:12]) + ("..." if len(val) > 12 else "")
         return "<NDEFRecord %s %r>" % (self.kind, val)
 
+    def __eq__(self, other):
+        # CircuitPython does not derive __ne__ from __eq__, so both are here.
+        return (isinstance(other, NDEFRecord)
+                and self.tnf == other.tnf
+                and bytes(self.type) == bytes(other.type)
+                and bytes(self.payload) == bytes(other.payload)
+                and bytes(self.id) == bytes(other.id))
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def to_bytes(self, first=True, last=True):
         """Encode this record. ``first``/``last`` set the MB/ME flags."""
         flags = self.tnf & 0x07
@@ -289,6 +315,15 @@ class NDEFRecord:
         """Build a MIME record, e.g. ``mime("image/png", data)``."""
         return cls(TNF_MIME, mime_type.encode("utf-8"), bytes(data))
 
+    @classmethod
+    def external(cls, type_name, data):
+        """Build an external-type record.
+
+        ``type_name`` is the domain-qualified name without the ``urn:nfc:ext:``
+        prefix, e.g. ``external("example.com:widget", b"...")``.
+        """
+        return cls(TNF_EXTERNAL, type_name.encode("utf-8"), bytes(data))
+
 
 class NDEFMessage:
     """A list of :class:`NDEFRecord`, with shortcuts for the common case."""
@@ -328,6 +363,14 @@ class NDEFMessage:
 
     def __repr__(self):
         return "<NDEFMessage %r>" % (self.records,)
+
+    def __eq__(self, other):
+        return (isinstance(other, NDEFMessage)
+                and len(self.records) == len(other.records)
+                and all(a == b for a, b in zip(self.records, other.records)))
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def to_bytes(self):
         """Encode the whole message."""
@@ -422,6 +465,10 @@ def _ndef_from_tlv(data):
             i += 2
         value = data[i:i + length]
         if tag == 0x03:                      # NDEF message TLV
+            if length == 0:
+                # A formatted but empty tag holds `03 00 FE`. That is a valid
+                # empty message, not a malformed one.
+                return None
             if len(value) < length:
                 raise NDEFError(
                     "NDEF message truncated: TLV says %d bytes, read %d "
@@ -441,6 +488,36 @@ def _ndef_to_tlv(message):
     return head + payload + b"\xfe"
 
 
+#: Statuses that mean "the radio glitched", not "the tag said no". A read that
+#: hits one of these is worth repeating: NFC links drop frames routinely when a
+#: tag is moved or held at the edge of the field, and giving up on the first
+#: one throws away everything read so far.
+TRANSIENT_STATUSES = (0x02, 0xB0, 0xB1, 0xB2)
+
+#: How many times a block read is attempted before giving up.
+READ_ATTEMPTS = const(3)
+
+
+def _is_transient(err):
+    if isinstance(err, TagTimeoutError):
+        return True
+    return isinstance(err, CommandError) and err.status in TRANSIENT_STATUSES
+
+
+def _read_retrying(reader, block, attempts=READ_ATTEMPTS):
+    """Read one block, repeating the attempt while the failure looks like RF
+    noise. A tag that answers "no" is not retried."""
+    last = None
+    for _ in range(attempts):
+        try:
+            return reader(block)
+        except (CommandError, TagTimeoutError) as err:
+            if not _is_transient(err):
+                raise
+            last = err
+    raise last
+
+
 # ----------------------------------------------------------------- tag types
 
 
@@ -451,13 +528,17 @@ class Tag:
     right subclass is chosen for you from the activated protocol.
     """
 
-    def __init__(self, nfc, disc_id, interface, protocol, tech, params):
+    def __init__(self, nfc, disc_id, interface, protocol, tech, params,
+                 max_payload=None):
         self._nfc = nfc
         self.discovery_id = disc_id
         self.interface = interface
         self.protocol = protocol
         self.technology = tech
         self.rf_params = params
+        #: Largest payload the controller will carry to this tag in one packet,
+        #: as reported at activation (``None`` if the tag was built by hand).
+        self.max_payload = max_payload
         self.sens_res = None
         self.sel_res = None
         self.dsfid = None
@@ -547,7 +628,49 @@ class Tag:
 
     def transceive(self, data, timeout=0.5):
         """Send a raw command to the tag and return its answer."""
+        if self.max_payload and len(data) > self.max_payload:
+            raise ValueError(
+                "%d bytes exceeds the %d the controller negotiated for this "
+                "tag" % (len(data), self.max_payload))
         return self._nfc._exchange(bytes(data), timeout)
+
+    def _probe(self):
+        """Send the cheapest command that proves the tag is still there.
+
+        Subclasses override this. Raising :class:`CommandError` still counts as
+        present - the tag answered, it just refused.
+        """
+        raise NotSupportedError(
+            "presence checking is not implemented for %s" % self.type)
+
+    def is_present(self):
+        """``True`` while the tag is still in the field.
+
+        Cheap enough to poll. Note that a Type 2 tag put to sleep by
+        :meth:`PN7150.resume_discovery` will report absent, so use this before
+        finishing with the tag, not after.
+        """
+        try:
+            self._probe()
+        except (TagLostError, TagTimeoutError):
+            return False
+        except CommandError:
+            return True
+        return True
+
+    def wait_for_removal(self, timeout=None, poll=0.1):
+        """Block until the tag leaves the field.
+
+        Returns ``True`` once it is gone, or ``False`` if ``timeout`` seconds
+        elapse first. Useful for "hold the badge until the door opens".
+        """
+        deadline = None if timeout is None else _deadline(timeout)
+        while True:
+            if not self.is_present():
+                return True
+            if deadline is not None and _expired(deadline):
+                return False
+            sleep(poll)
 
     def __str__(self):
         out = "%s  %s  UID %s" % (self.type, self.technology_name,
@@ -564,7 +687,11 @@ class Tag:
         return "<%s %s>" % (self.__class__.__name__, self.uid_hex)
 
     def dump(self):
-        """A multi-line description of everything known about the tag."""
+        """A multi-line description of everything known about the tag.
+
+        Like ``str(tag)``, this touches :attr:`ndef`, so the first call reads
+        from the tag and blocks. Use :func:`repr` for a no-I/O one-liner.
+        """
         lines = [
             "Tag type   : %s" % self.type,
             "Technology : %s" % self.technology_name,
@@ -596,6 +723,14 @@ class Type2Tag(Tag):
     """NTAG / MIFARE Ultralight. Pages are 4 bytes; a READ returns 4 pages."""
 
     PAGE_SIZE = 4
+    DEFAULT_CAPACITY = 48         # a bare Ultralight, with no usable CC
+
+    # Class-level default so the cache works even for instances built without
+    # going through Type2Tag.__init__ (the test doubles do this).
+    _capacity = None
+
+    def _probe(self):
+        self.transceive(b"\x30\x00", 0.1)
 
     def read(self, page):
         """READ command: returns 16 bytes (4 consecutive pages)."""
@@ -605,37 +740,68 @@ class Type2Tag(Tag):
 
     @property
     def capacity(self):
-        """Usable data bytes, from the capability container in page 3."""
-        try:
-            cc = self.read(3)[:4]
-        except PN7150Error:
-            return 48
-        if cc[0] != 0xE1:
-            return 48
-        return cc[2] * 8
+        """Usable data bytes, from the capability container in page 3.
 
-    def write(self, page, data):
-        """WRITE one 4-byte page. Refuses pages 0-3 (UID and lock bytes)."""
+        Read once and cached: :meth:`write` consults it on every page, and a
+        round trip per page would triple the cost of a write.
+        """
+        if self._capacity is None:
+            try:
+                cc = self.read(3)[:4]
+            except PN7150Error:
+                return self.DEFAULT_CAPACITY      # do not cache a failure
+            # Not every tag answers a READ of page 3 with four pages: one in
+            # this survey returned a single byte. Anything shorter than a CC
+            # is treated as "no usable CC", never indexed blindly.
+            if len(cc) < 3 or cc[0] != 0xE1:
+                self._capacity = self.DEFAULT_CAPACITY
+            else:
+                self._capacity = cc[2] * 8
+        return self._capacity
+
+    @property
+    def last_data_page(self):
+        """Highest page holding user data, per the capability container."""
+        return 3 + self.capacity // self.PAGE_SIZE
+
+    def write(self, page, data, force=False):
+        """WRITE one 4-byte page.
+
+        Pages 0-3 (UID, lock bits, capability container) are always refused.
+        Pages past the end of user memory are refused too, because on an NTAG
+        they are the dynamic lock bytes, the mirror/AUTH0 config and the
+        password - writing there can lock a tag permanently. Pass
+        ``force=True`` only if you know the tag's real layout; it lifts the
+        upper bound, never the lower one.
+        """
         data = bytes(data)
-        if len(data) != 4:
+        if len(data) != self.PAGE_SIZE:
             raise ValueError("a Type 2 page is exactly 4 bytes")
         if page < 4:
             raise ValueError(
                 "refusing to write page %d: pages 0-3 hold the UID, lock bits "
                 "and capability container" % page)
+        if not force:
+            last = self.last_data_page
+            if page > last:
+                raise ValueError(
+                    "refusing to write page %d: the capability container "
+                    "declares user memory ending at page %d, and the pages "
+                    "beyond it are lock bits, config and password bytes "
+                    "(pass force=True to override)" % (page, last))
         resp = self.transceive(bytes([0xA2, page & 0xFF]) + data)
         if resp and resp[-1] not in (0x00, 0x0A):
             raise CommandError("write of page %d failed (0x%02x)"
                                % (page, resp[-1]))
         return True
 
-    def read_memory(self, start=4, pages=16):
+    def read_memory(self, start=4, pages=16, attempts=READ_ATTEMPTS):
         """Read a run of pages, returning one flat ``bytes``."""
         out = bytearray()
         page = start
         while page < start + pages:
             try:
-                blk = self.read(page)
+                blk = _read_retrying(self.read, page, attempts)
             except (CommandError, TagLostError, TagTimeoutError):
                 break
             if not blk:
@@ -650,14 +816,24 @@ class Type2Tag(Tag):
         return _read_ndef_area(self.read, 4, 4, self.capacity)
 
     def write_ndef(self, message):
-        """Write an :class:`NDEFMessage` starting at page 4."""
+        """Write an :class:`NDEFMessage` starting at page 4.
+
+        Raises :class:`NDEFError` if the message does not fit in the capacity
+        the tag's capability container declares, rather than running off the
+        end of user memory into the config pages.
+        """
         if isinstance(message, str):
             message = NDEFMessage.from_uri(message) if "://" in message \
                 else NDEFMessage.from_text(message)
         payload = _ndef_to_tlv(message)
-        payload += b"\x00" * (-len(payload) % 4)
-        for i in range(0, len(payload), 4):
-            self.write(4 + i // 4, payload[i:i + 4])
+        capacity = self.capacity
+        if len(payload) > capacity:
+            raise NDEFError(
+                "message needs %d bytes (with its TLV wrapper) but the tag "
+                "declares %d" % (len(payload), capacity))
+        payload += b"\x00" * (-len(payload) % self.PAGE_SIZE)
+        for i in range(0, len(payload), self.PAGE_SIZE):
+            self.write(4 + i // self.PAGE_SIZE, payload[i:i + self.PAGE_SIZE])
         self._ndef = message
         self._ndef_read = True
         return True
@@ -684,12 +860,17 @@ class Type4Tag(Tag):
         return bytes(resp[:-2]), (resp[-2] << 8) | resp[-1]
 
     def select_ndef_application(self):
-        """Select the NDEF application (tries the v2.0 AID, then v1.0)."""
+        """Select the NDEF application (tries the v2.0 AID, then v1.0).
+
+        Returns ``False`` rather than raising when the card does not answer:
+        plenty of ISO-DEP cards (hotel keys, transit, payment) simply ignore
+        the SELECT, and "no NDEF application" is the right answer for them.
+        """
         for aid in (b"\x00\xa4\x04\x00\x07\xd2\x76\x00\x00\x85\x01\x01\x00",
                     b"\x00\xa4\x04\x00\x07\xd2\x76\x00\x00\x85\x01\x00"):
             try:
                 _, sw = self.apdu(aid)
-            except CommandError:
+            except PN7150Error:
                 continue
             if sw == 0x9000:
                 return True
@@ -699,12 +880,26 @@ class Type4Tag(Tag):
         _, sw = self.apdu(b"\x00\xa4\x00\x0c\x02" + bytes(file_id))
         return sw == 0x9000
 
+    def _probe(self):
+        # An invalid class byte: the card answers 6E00, which is all we need.
+        self.transceive(b"\x00\x00\x00\x00\x00", 0.3)
+
     def read_binary(self, offset, length):
         data, sw = self.apdu(bytes([0x00, 0xB0, (offset >> 8) & 0xFF,
                                     offset & 0xFF, length & 0xFF]))
         if sw != 0x9000:
             raise CommandError("READ BINARY failed, SW=%04x" % sw)
         return data
+
+    def update_binary(self, offset, data):
+        """UPDATE BINARY: write into the currently selected file."""
+        data = bytes(data)
+        _, sw = self.apdu(bytes([0x00, 0xD6, (offset >> 8) & 0xFF,
+                                 offset & 0xFF, len(data)]) + data)
+        if sw != 0x9000:
+            raise CommandError("UPDATE BINARY at %d failed, SW=%04x"
+                               % (offset, sw))
+        return True
 
     def read_ndef(self):
         if not self.select_ndef_application():
@@ -730,6 +925,50 @@ class Type4Tag(Tag):
             offset += chunk
         return NDEFMessage.from_bytes(bytes(data[:nlen]))
 
+    def write_ndef(self, message):
+        """Write an :class:`NDEFMessage` to the tag's NDEF file.
+
+        Follows the NFC Forum Type 4 write flow: zero NLEN first, so a tag
+        interrupted mid-write reads as empty rather than as a truncated
+        message, then the data, then the real NLEN.
+
+        Not verified against physical hardware - no writable Type 4 tag was
+        available. The read path in :meth:`read_ndef` is.
+        """
+        if isinstance(message, str):
+            message = NDEFMessage.from_uri(message) if "://" in message \
+                else NDEFMessage.from_text(message)
+        payload = message.to_bytes()
+        if not self.select_ndef_application():
+            raise NotSupportedError("no NDEF application on this card")
+        if not self.select_file(b"\xe1\x03"):
+            raise NotSupportedError("no capability container on this card")
+        cc = self.read_binary(0, 15)
+        if len(cc) < 15:
+            raise CommandError("short capability container")
+        file_id = cc[9:11]
+        # CC bytes 11..12 are the NDEF file's maximum size, NLEN included.
+        max_size = (cc[11] << 8) | cc[12]
+        if cc[14] != 0x00:
+            raise NotSupportedError("the NDEF file is read only (0x%02x)"
+                                    % cc[14])
+        if len(payload) + 2 > max_size:
+            raise NDEFError("message needs %d bytes but the NDEF file holds %d"
+                            % (len(payload) + 2, max_size - 2))
+        if not self.select_file(file_id):
+            raise CommandError("could not select the NDEF file")
+        self.update_binary(0, b"\x00\x00")
+        offset = 2
+        for i in range(0, len(payload), 0xF0):
+            chunk = payload[i:i + 0xF0]
+            self.update_binary(offset, chunk)
+            offset += len(chunk)
+        self.update_binary(0, bytes([(len(payload) >> 8) & 0xFF,
+                                     len(payload) & 0xFF]))
+        self._ndef = message
+        self._ndef_read = True
+        return True
+
 
 class MifareClassicTag(Tag):
     """MIFARE Classic.
@@ -741,6 +980,44 @@ class MifareClassicTag(Tag):
     """
 
     BLOCK_SIZE = 16
+
+    @property
+    def block_count(self):
+        """Total blocks, inferred from SAK. 1K unless the card says otherwise.
+
+        SAK 0x08/0x88 is 1K (64 blocks), 0x18/0x98 is 4K (256 blocks) and 0x09
+        is Mini (20 blocks). The high bit varies between NXP and clone silicon,
+        hence the mask.
+        """
+        sak = self.sel_res
+        if sak is not None:
+            if sak & 0x7F == 0x18:
+                return 256
+            if sak & 0x7F == 0x09:
+                return 20
+        return 64
+
+    @staticmethod
+    def sector_of(block):
+        """Sector containing ``block``. Sectors 0-31 hold 4 blocks, 32-39 hold
+        16 (only 4K cards have those)."""
+        if block < 128:
+            return block // 4
+        return 32 + (block - 128) // 16
+
+    @staticmethod
+    def first_block_of(sector):
+        """First block of ``sector``."""
+        if sector < 32:
+            return sector * 4
+        return 128 + (sector - 32) * 16
+
+    @staticmethod
+    def is_trailer(block):
+        """True for a sector trailer, which holds keys and access bits."""
+        if block < 128:
+            return block % 4 == 3
+        return (block - 128) % 16 == 15
 
     def authenticate(self, sector, key=KEY_DEFAULT, key_b=False):
         """Authenticate a sector.
@@ -769,6 +1046,10 @@ class MifareClassicTag(Tag):
                 (sector, "" if not resp else " (0x%02x)" % resp[-1]))
         return True
 
+    def _probe(self):
+        # Unauthenticated, so the card refuses - but refusing proves presence.
+        self.transceive(b"\x10\x30\x00", 0.1)
+
     def read_block(self, block):
         """Read one 16-byte block. Its sector must be authenticated first.
 
@@ -783,44 +1064,159 @@ class MifareClassicTag(Tag):
             body = body[1:]
         return bytes(body)
 
+    def write_block(self, block, data, force=False):
+        """Write one 16-byte block. Its sector must be authenticated first.
+
+        MIFARE writes are two exchanges, not one: the command ``10 A0 <block>``
+        is acknowledged before the 16 data bytes are sent as ``10 <data>``.
+        (Both frames confirmed against NXP's own reference implementation.)
+
+        Block 0 is the manufacturer block and is always refused. Sector
+        trailers are refused unless ``force=True``, because they hold the keys
+        and the access bits: a trailer written with the wrong access bits
+        locks that sector for good, with no way back. This driver cannot
+        format a card, so there is no ordinary reason to write one.
+        """
+        data = bytes(data)
+        if len(data) != self.BLOCK_SIZE:
+            raise ValueError("a MIFARE Classic block is exactly %d bytes"
+                             % self.BLOCK_SIZE)
+        if block == 0:
+            raise ValueError("refusing to write block 0: it is the read-only "
+                             "manufacturer block (UID and BCC)")
+        if self.is_trailer(block) and not force:
+            raise ValueError(
+                "refusing to write block %d: it is the trailer of sector %d, "
+                "holding the keys and access bits. Wrong access bits lock the "
+                "sector permanently (pass force=True if you are certain)"
+                % (block, self.sector_of(block)))
+        resp = self.transceive(bytes([0x10, 0xA0, block & 0xFF]))
+        if not resp or resp[-1] != 0x00:
+            raise CommandError(
+                "write of block %d was not accepted%s" %
+                (block, "" if not resp else " (0x%02x)" % resp[-1]),
+                resp[-1] if resp else None)
+        resp = self.transceive(bytes([0x10]) + data)
+        if not resp or resp[-1] != 0x00:
+            raise CommandError(
+                "data for block %d was not accepted%s" %
+                (block, "" if not resp else " (0x%02x)" % resp[-1]),
+                resp[-1] if resp else None)
+        return True
+
+    def ndef_blocks(self):
+        """The data blocks that hold NDEF, in order.
+
+        Sector 0 is the MAD, sector trailers hold keys, and on a 4K card
+        sector 16 is MAD2. None of them carry message data.
+        """
+        blocks = []
+        total = self.block_count
+        block = 4
+        while block < total:
+            if not self.is_trailer(block) and not (
+                    total > 64 and self.sector_of(block) == 16):
+                blocks.append(block)
+            block += 1
+        return blocks
+
+    @property
+    def ndef_capacity(self):
+        """Bytes available for an NDEF message, TLV wrapper included."""
+        return len(self.ndef_blocks()) * self.BLOCK_SIZE
+
+    def write_ndef(self, message, key=KEY_NDEF):
+        """Write an :class:`NDEFMessage` to an already NDEF-formatted card.
+
+        Formatting is *not* done here: a card that is not already formatted
+        has no NDEF key and no MAD, and setting those up means writing sector
+        trailers, which risks locking sectors permanently. Use a dedicated
+        tool for that; this only fills in the message.
+
+        Not verified against physical hardware - no NDEF-formatted writable
+        MIFARE Classic was available.
+        """
+        if isinstance(message, str):
+            message = NDEFMessage.from_uri(message) if "://" in message \
+                else NDEFMessage.from_text(message)
+        payload = _ndef_to_tlv(message)
+        capacity = self.ndef_capacity
+        if len(payload) > capacity:
+            raise NDEFError(
+                "message needs %d bytes (with its TLV wrapper) but the card "
+                "holds %d" % (len(payload), capacity))
+        payload += b"\x00" * (-len(payload) % self.BLOCK_SIZE)
+        self.authenticate(1, key)
+        sector = 1
+        for i, block in enumerate(self.ndef_blocks()):
+            if i * self.BLOCK_SIZE >= len(payload):
+                break
+            if self.sector_of(block) != sector:
+                sector = self.sector_of(block)
+                self.authenticate(sector, key)
+            self.write_block(block,
+                             payload[i * self.BLOCK_SIZE:
+                                     (i + 1) * self.BLOCK_SIZE])
+        self._ndef = message
+        self._ndef_read = True
+        return True
+
     def read_sector(self, sector, key=KEY_DEFAULT):
-        """Authenticate then read all four blocks of a sector."""
+        """Authenticate then read every block of a sector, trailer included.
+
+        Sectors 0-31 are four blocks; on a 4K card sectors 32-39 are sixteen.
+        """
         self.authenticate(sector, key)
-        first = sector * 4
-        return b"".join(self.read_block(first + i) for i in range(4))
+        first = self.first_block_of(sector)
+        count = 4 if sector < 32 else 16
+        return b"".join(self.read_block(first + i) for i in range(count))
 
     def read_ndef(self):
         # NDEF-formatted Classic tags keep their data from sector 1 onward,
-        # under the NFC Forum key.
+        # under the NFC Forum key. Each sector needs its own authentication.
         try:
             self.authenticate(1, KEY_NDEF)
         except CommandError:
             return None
         data = bytearray()
-        block = 4
-        while block < 64:
-            if block % 4 == 3:        # sector trailer, skip
-                block += 1
-                continue
-            if block % 4 == 0 and block > 4:
+        for block in self.ndef_blocks():
+            sector = self.sector_of(block)
+            if block == self.first_block_of(sector) and sector != 1:
                 try:
-                    self.authenticate(block // 4, KEY_NDEF)
+                    self.authenticate(sector, KEY_NDEF)
                 except CommandError:
                     break
             try:
                 data += self.read_block(block)
-            except (CommandError, TagLostError):
+            except (CommandError, TagLostError, TagTimeoutError):
                 break
-            block += 1
-            if len(data) >= 48 and bytes(data).find(b"\xfe") >= 0:
+            # Stop on the length the TLV itself declares. The old test - "a
+            # 0xFE byte appeared somewhere" - truncated any message whose
+            # binary payload happened to contain one.
+            end = _ndef_tlv_end(data)
+            if end == TLV_NO_NDEF:
+                return None
+            if end != TLV_NEED_MORE and len(data) >= end:
                 break
         return _ndef_from_tlv(bytes(data))
 
 
 class Type5Tag(Tag):
-    """ISO 15693 / NFC-V vicinity tags."""
+    """ISO 15693 / NFC-V vicinity tags.
+
+    The capability container is 4 bytes on most tags, but 8 on any tag whose
+    T5T area exceeds 2040 bytes: MLEN cannot be expressed in one byte, so it
+    is zeroed and a 16-bit MLEN appears in bytes 6-7 instead. The T5T area
+    starts immediately after the CC, which means block 2 rather than block 1
+    for those tags. (NFC Forum T5T Operation spec; see also ST AN4911.)
+    """
 
     BLOCK_SIZE = 4
+    # Class-level default so the cache also works for hand-built instances.
+    _cc = None
+
+    def _probe(self):
+        self.transceive(b"\x02\x20\x00", 0.2)
 
     def read_block(self, block):
         """READ SINGLE BLOCK. Flags 0x02 = high data rate, no option.
@@ -837,32 +1233,127 @@ class Type5Tag(Tag):
                                % (block, payload[0]))
         return bytes(payload[1:])
 
-    def read_memory(self, start=0, blocks=16):
+    def read_memory(self, start=0, blocks=16, attempts=READ_ATTEMPTS):
         out = bytearray()
         for b in range(start, start + blocks):
             try:
-                out += self.read_block(b)
+                out += _read_retrying(self.read_block, b, attempts)
             except (CommandError, TagLostError, TagTimeoutError):
                 break
         return bytes(out)
 
+    def write_block(self, block, data):
+        """WRITE SINGLE BLOCK.
+
+        Refuses block 0, which is the capability container. The timeout is
+        generous because ISO15693 tags take milliseconds to commit a write.
+
+        Not verified against physical hardware.
+        """
+        data = bytes(data)
+        if len(data) != self.BLOCK_SIZE:
+            raise ValueError("an ISO15693 block is exactly %d bytes"
+                             % self.BLOCK_SIZE)
+        try:
+            first = self.first_data_block
+        except PN7150Error:
+            first = 1                         # CC unreadable; guard block 0
+        if block < first:
+            raise ValueError(
+                "refusing to write block %d: it is part of the %d-byte "
+                "capability container" % (block, first * self.BLOCK_SIZE))
+        resp = self.transceive(bytes([0x02, 0x21, block & 0xFF]) + data, 1.0)
+        payload, _ = _split_status(resp, "write of block %d" % block)
+        if payload and payload[0] != 0x00:
+            raise CommandError("write of block %d failed (flags 0x%02x)"
+                               % (block, payload[0]))
+        return True
+
+    def _read_cc(self):
+        """Read the CC once and cache it, fetching block 1 too when it is the
+        8-byte form."""
+        if self._cc is None:
+            cc = bytes(self.read_block(0))
+            if len(cc) >= 3 and cc[2] == 0x00:
+                try:
+                    cc += bytes(self.read_block(1))
+                except PN7150Error:
+                    pass          # keep the 4 bytes we have
+            self._cc = cc
+        return self._cc
+
     @property
     def capability_container(self):
-        """Block 0 holds the Type 5 CC: ``E1 <ver/access> <MLEN> <features>``."""
-        return self.read_block(0)
+        """The Type 5 CC: ``E1 <ver/access> <MLEN> <features>``, or the 8-byte
+        form ``E2 <ver/access> 00 <features> <rfu x2> <MLEN hi> <MLEN lo>``."""
+        return self._read_cc()
+
+    @property
+    def cc_size(self):
+        """4 or 8 bytes. Byte 2 being zero is what marks the long form."""
+        cc = self._read_cc()
+        return 8 if (len(cc) >= 3 and cc[2] == 0x00) else 4
+
+    @property
+    def first_data_block(self):
+        """First block of the T5T area, which begins right after the CC."""
+        return self.cc_size // self.BLOCK_SIZE
+
+    @property
+    def formatted(self):
+        """True if the CC carries an NFC Forum magic number."""
+        cc = self._read_cc()
+        return len(cc) >= 3 and cc[0] in (0xE1, 0xE2)
+
+    @property
+    def capacity(self):
+        """Usable data bytes: ``MLEN * 8``, from whichever CC form is present."""
+        try:
+            cc = self._read_cc()
+        except PN7150Error:
+            return 0
+        if not (len(cc) >= 3 and cc[0] in (0xE1, 0xE2)):
+            return 0
+        if cc[2]:
+            return cc[2] * 8
+        if len(cc) >= 8:                      # 16-bit MLEN, big endian
+            return ((cc[6] << 8) | cc[7]) * 8
+        return 0
+
+    def write_ndef(self, message):
+        """Write an :class:`NDEFMessage` starting at block 1.
+
+        Not verified against physical hardware.
+        """
+        if isinstance(message, str):
+            message = NDEFMessage.from_uri(message) if "://" in message \
+                else NDEFMessage.from_text(message)
+        payload = _ndef_to_tlv(message)
+        capacity = self.capacity
+        if capacity and len(payload) > capacity:
+            raise NDEFError(
+                "message needs %d bytes (with its TLV wrapper) but the tag "
+                "declares %d" % (len(payload), capacity))
+        payload += b"\x00" * (-len(payload) % self.BLOCK_SIZE)
+        first = self.first_data_block
+        for i in range(0, len(payload), self.BLOCK_SIZE):
+            self.write_block(first + i // self.BLOCK_SIZE,
+                             payload[i:i + self.BLOCK_SIZE])
+        self._ndef = message
+        self._ndef_read = True
+        return True
 
     def read_ndef(self):
-        # Block 0 is the capability container, NOT part of the TLV area -
-        # parsing from block 0 makes the CC look like a bogus TLV. The real
-        # data starts at block 1 (CC is 4 bytes on these tags).
+        # The CC is NOT part of the TLV area - parsing from block 0 makes it
+        # look like a bogus TLV. The data starts right after it, which is
+        # block 1 for a 4-byte CC and block 2 for the 8-byte form.
         try:
-            cc = self.capability_container
+            if not self.formatted:
+                return _read_ndef_area(self.read_block, 0, 1, 128)
+            return _read_ndef_area(self.read_block, self.first_data_block, 1,
+                                   self.capacity or 128)
         except PN7150Error:
             return _read_ndef_area(self.read_block, 0, 1, 128)
-        if len(cc) >= 3 and cc[0] in (0xE1, 0xE2):
-            limit = cc[2] * 8 or 128
-            return _read_ndef_area(self.read_block, 1, 1, limit)
-        return _read_ndef_area(self.read_block, 0, 1, 128)
 
 
 # FeliCa Status Flag 2 values (JIS X 6319-4).
@@ -900,6 +1391,11 @@ class Type3Tag(Tag):
     def idm(self):
         """The card's IDm (identical to NFCID2)."""
         return self.uid
+
+    def _probe(self):
+        # A card with no NDEF service answers with an error, which still
+        # proves it is in the field - is_present() treats that as present.
+        self.check(0)
 
     def check(self, block, service=SERVICE_NDEF_RO):
         """FeliCa CHECK: read one 16-byte block.
@@ -956,11 +1452,13 @@ class Type3Tag(Tag):
         """True if the card exposes the NFC Forum NDEF service (0x000B).
 
         Transit and payment cards generally do not: they answer CHECK with
-        SF2 = 0xA6 (service not present).
+        SF2 = 0xA6 (service not present). Some simply do not answer at all,
+        which is also a "no" - hence catching every driver error here rather
+        than only :class:`CommandError`.
         """
         try:
             self.check(0)
-        except CommandError:
+        except PN7150Error:
             return False
         return True
 
@@ -1014,11 +1512,55 @@ def _split_status(resp, what="tag command"):
         raise CommandError("%s: empty response" % what)
     status = resp[-1]
     if status != 0x00:
-        raise CommandError("%s failed (status 0x%02x)" % (what, status))
+        raise CommandError("%s failed (status 0x%02x %s)"
+                           % (what, status,
+                              STATUS_NAMES.get(status, "unknown")), status)
     return resp[:-1], status
 
 
-def _read_ndef_area(reader, first_block, blocks_per_read, limit):
+# _ndef_tlv_end() return values.
+TLV_NEED_MORE = const(-1)
+TLV_NO_NDEF = const(0)
+
+
+def _ndef_tlv_end(data):
+    """How many bytes of a TLV area must be read for the NDEF message.
+
+    Returns the offset just past the NDEF message, :data:`TLV_NO_NDEF` (0) if
+    the area definitively holds no message, or :data:`TLV_NEED_MORE` (-1) if
+    the answer is not yet knowable from ``data``.
+
+    Scanning the declared length is the only safe way to know when to stop:
+    ``0xFE`` is a terminator only *between* TLVs, and is perfectly ordinary
+    inside a binary payload.
+    """
+    i = 0
+    data = bytes(data)
+    while True:
+        if i >= len(data):
+            return TLV_NEED_MORE
+        tag = data[i]
+        if tag == 0x00:                      # NULL TLV, skip
+            i += 1
+            continue
+        if tag == 0xFE:                      # terminator
+            return TLV_NO_NDEF
+        if i + 1 >= len(data):
+            return TLV_NEED_MORE
+        length = data[i + 1]
+        i += 2
+        if length == 0xFF:                   # 3-byte length form
+            if i + 2 > len(data):
+                return TLV_NEED_MORE
+            length = (data[i] << 8) | data[i + 1]
+            i += 2
+        if tag == 0x03:                      # NDEF message TLV
+            return i + length if length else TLV_NO_NDEF
+        i += length
+
+
+def _read_ndef_area(reader, first_block, blocks_per_read, limit,
+                    attempts=READ_ATTEMPTS):
     """Read a TLV area a chunk at a time, stopping as soon as the NDEF message
     is complete. Avoids reading past the end of tag memory, which makes tags
     stop answering."""
@@ -1026,21 +1568,18 @@ def _read_ndef_area(reader, first_block, blocks_per_read, limit):
     block = first_block
     while len(data) < limit:
         try:
-            chunk = reader(block)
+            chunk = _read_retrying(reader, block, attempts)
         except (CommandError, TagLostError, TagTimeoutError):
             break
         if not chunk:
             break
         data += chunk
         block += blocks_per_read
-        try:
-            msg = _ndef_from_tlv(bytes(data))
-        except NDEFError:
-            continue              # message started but not all here yet
-        if msg is not None:
-            return msg
-        if bytes(data).find(b"\xfe") >= 0:
-            return None           # terminator reached, genuinely no NDEF
+        end = _ndef_tlv_end(data)
+        if end == TLV_NO_NDEF:
+            return None           # terminator or empty message: genuinely none
+        if end != TLV_NEED_MORE and len(data) >= end:
+            break                 # the whole message is in hand
     return _ndef_from_tlv(bytes(data))
 
 
@@ -1055,6 +1594,24 @@ _DISCOVER_MAP_RW = (b"\x21\x00\x10\x05\x01\x01\x01\x02\x01\x01\x03\x01\x01"
 
 DEFAULT_TECHNOLOGIES = (TECH_NFC_A, TECH_NFC_B, TECH_NFC_F, TECH_NFC_V)
 
+# Which RF interface each protocol is activated on; mirrors _DISCOVER_MAP_RW.
+_PROTOCOL_INTERFACES = {
+    PROTOCOL_T1T: INTERFACE_FRAME,
+    PROTOCOL_T2T: INTERFACE_FRAME,
+    PROTOCOL_T3T: INTERFACE_FRAME,
+    PROTOCOL_T5T: INTERFACE_FRAME,
+    PROTOCOL_ISO_DEP: INTERFACE_ISO_DEP,
+    PROTOCOL_MIFARE: INTERFACE_TAG,
+}
+
+#: Order in which to pick when one card offers several protocols. MIFARE comes
+#: before ISO-DEP deliberately: the cards that advertise both (MIFARE Plus in
+#: SL1, and the UID-changeable "magic" clones) are Classic cards underneath,
+#: and selecting ISO-DEP on them activates an interface that then answers
+#: nothing useful.
+DEFAULT_PROTOCOL_PREFERENCE = (PROTOCOL_T2T, PROTOCOL_T3T, PROTOCOL_T5T,
+                               PROTOCOL_T1T, PROTOCOL_MIFARE, PROTOCOL_ISO_DEP)
+
 
 class PN7150:
     """Driver for the NXP PN7150 NFC controller.
@@ -1067,7 +1624,8 @@ class PN7150:
     """
 
     def __init__(self, scl=None, sda=None, irq=None, ven=None,
-                 i2c=None, address=0x28, frequency=100000, debug=False):
+                 i2c=None, address=0x28, frequency=100000, debug=False,
+                 protocol_preference=DEFAULT_PROTOCOL_PREFERENCE):
         if irq is None or ven is None:
             raise ValueError("irq and ven pins are required")
         self._own_bus = False
@@ -1084,10 +1642,15 @@ class PN7150:
         self._ven = DigitalInOut(ven)
         self._ven.switch_to_output(False)
         self._buf = bytearray(3 + 255)
+        self._deinited = False
         self._connected = False
         self._discovering = False
         self._mapped = False
         self._technologies = DEFAULT_TECHNOLOGIES
+        self.protocol_preference = protocol_preference
+        #: Candidates from the most recent multi-protocol discovery, as
+        #: ``(discovery_id, protocol, technology, params)`` tuples.
+        self.candidates = []
         self.firmware_version = None
         self.build_number = None
 
@@ -1115,16 +1678,20 @@ class PN7150:
         return False
 
     def deinit(self):
-        """Power the controller down and release the pins."""
+        """Power the controller down and release the pins. Safe to call twice."""
+        if self._deinited:
+            return
+        self._deinited = True
         try:
             self._ven.value = False
-        except Exception:  # pylint: disable=broad-except
-            pass
+        except ValueError:
+            pass          # already released; nothing left to pull low
         self._irq.deinit()
         self._ven.deinit()
         if self._own_bus:
             self._i2c.deinit()
         self._connected = False
+        self._discovering = False
 
     def hard_reset(self):
         """Pulse VEN to reset the controller."""
@@ -1235,6 +1802,7 @@ class PN7150:
         if not self._discovering:
             self.start_discovery()
         deadline = None if timeout is None else _deadline(timeout)
+        found = []
         with _Bus(self._i2c):
             while True:
                 pkt = self._read_frame(0.2)
@@ -1244,10 +1812,29 @@ class PN7150:
                     continue
                 if pkt[0] == 0x61 and pkt[1] == 0x05:
                     return self._build_tag(pkt)
+                if pkt[0] == 0x61 and pkt[1] == 0x03:
+                    # RF_DISCOVER_NTF. A card that offers more than one
+                    # protocol is not activated automatically: the NFCC lists
+                    # the candidates and waits in W4_HOST_SELECT for the host
+                    # to choose. Ignoring these leaves the reader in a state
+                    # that is not polling, i.e. permanently blind.
+                    cand = _parse_discover_ntf(pkt)
+                    if cand is not None:
+                        found.append(cand)
+                    if pkt[-1] != 0x02:          # 0x02 = more notifications
+                        self.candidates = list(found)
+                        self._select_candidate(found)
+                        found = []
 
     def read_tag(self, timeout=None):
-        """Wait for one tag, then stop polling. Convenience for one-shot use."""
+        """Wait for one tag, then stop polling. Convenience for one-shot use.
+
+        The tag stays activated, so it can still be read; call
+        :meth:`start_discovery` again to look for the next one.
+        """
         tag = self.wait_for_tag(timeout)
+        if tag is None:
+            self.stop_discovery()
         return tag
 
     def scan(self, timeout=None, skip_repeats=True):
@@ -1256,6 +1843,10 @@ class PN7150:
         By default a tag left sitting on the antenna is reported once: it is
         put to sleep after being read, so it stays quiet until it leaves the
         field and comes back.
+
+        ``timeout`` is the wait for *each* tag, not a budget for the whole
+        loop: the generator ends the first time that many seconds pass with
+        nothing presented. ``None`` waits forever.
         """
         self._require_connection()
         if not self._discovering:
@@ -1289,6 +1880,45 @@ class PN7150:
         self.start_discovery(self._technologies)
         return True
 
+    def _select_candidate(self, candidates):
+        """Activate one of the targets listed by RF_DISCOVER_NTF.
+
+        Tries them in :attr:`protocol_preference` order and falls through to
+        the next if the NFCC rejects the choice. If none can be selected the
+        controller is dropped back to idle and polling restarted, because
+        leaving it in W4_HOST_SELECT would make it deaf to every later tag.
+        """
+        if not candidates:
+            return False
+        order = []
+        for wanted in self.protocol_preference:
+            for cand in candidates:
+                if cand[1] == wanted and cand not in order:
+                    order.append(cand)
+        for cand in candidates:                  # anything not ranked, last
+            if cand not in order:
+                order.append(cand)
+
+        for disc_id, protocol, _tech, _params in order:
+            interface = _PROTOCOL_INTERFACES.get(protocol, INTERFACE_FRAME)
+            try:
+                rsp = self._command(
+                    bytes([0x21, 0x04, 0x03, disc_id, protocol, interface]),
+                    timeout=0.5)
+            except (CommandError, TagTimeoutError):
+                continue
+            if len(rsp) >= 4 and rsp[0] == 0x41 and rsp[3] == 0x00:
+                return True                      # activation NTF follows
+        # Nothing could be selected: get out of W4_HOST_SELECT.
+        self._deactivate(0x00)
+        self._drain()
+        self._discovering = False
+        try:
+            self.start_discovery(self._technologies)
+        except PN7150Error:
+            pass
+        return False
+
     def _build_tag(self, pkt):
         # RF_INTF_ACTIVATED_NTF: 3 header bytes, then
         # id, interface, protocol, tech, max payload, credits, n_params, params
@@ -1296,9 +1926,11 @@ class PN7150:
         interface = pkt[4]
         protocol = pkt[5]
         tech = pkt[6]
+        max_payload = pkt[7] if len(pkt) > 7 else None
         params = pkt[10:]
         cls = _TAG_CLASSES.get(protocol, Tag)
-        return cls(self, disc_id, interface, protocol, tech, params)
+        return cls(self, disc_id, interface, protocol, tech, params,
+                   max_payload)
 
     # -- transport -------------------------------------------------------
 
@@ -1348,8 +1980,16 @@ class PN7150:
             raise TagTimeoutError("no response to %s" % hexlify(cmd[:2]))
         return rsp
 
+    #: Largest payload one NCI data packet can carry (the length field is a
+    #: single byte). Segmentation of longer payloads is not implemented.
+    MAX_PACKET_PAYLOAD = const(255)
+
     def _exchange(self, payload, timeout=0.5):
         """Send a data packet to the activated tag and return its answer."""
+        if len(payload) > self.MAX_PACKET_PAYLOAD:
+            raise ValueError(
+                "payload of %d bytes exceeds the 255-byte NCI packet limit; "
+                "segmentation is not implemented" % len(payload))
         frame = bytes([0x00, 0x00, len(payload)]) + bytes(payload)
         with _Bus(self._i2c):
             self._write_frame(frame)
@@ -1368,7 +2008,34 @@ class PN7150:
                     return pkt[3:]
                 if pkt[0] == 0x61 and pkt[1] == 0x06:
                     raise TagLostError("tag left the field")
+                if pkt[0] == 0x60 and pkt[1] in (0x07, 0x08):
+                    # CORE_GENERIC_ERROR_NTF / CORE_INTERFACE_ERROR_NTF: the
+                    # controller is telling us this exchange failed, and its
+                    # status byte says why. Treating these as "a notification
+                    # we do not care about" means waiting out the full timeout
+                    # and then reporting a vague "tag did not answer" instead
+                    # of the RF_TIMEOUT_ERROR the NFCC already diagnosed.
+                    # Payload is <status> for 0x07, <status> <conn id> for
+                    # 0x08 (NCI 1.0; matches the Linux nci_core_intf_error_ntf).
+                    status = pkt[3] if len(pkt) > 3 else 0
+                    self._drain()
+                    raise CommandError(
+                        "controller reported %s (0x%02x) during the exchange"
+                        % (STATUS_NAMES.get(status, "an error"), status),
+                        status)
                 # anything else is a notification we do not care about
+
+
+def _parse_discover_ntf(pkt):
+    """Pull ``(discovery_id, protocol, technology, params)`` out of an
+    RF_DISCOVER_NTF, or ``None`` if the frame is too short to be one."""
+    if len(pkt) < 8:
+        return None
+    disc_id = pkt[3]
+    protocol = pkt[4]
+    tech = pkt[5]
+    n = pkt[6]
+    return (disc_id, protocol, tech, bytes(pkt[7:7 + n]))
 
 
 class _Bus:
