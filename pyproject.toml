@@ -1,0 +1,38 @@
+# Packaging metadata. Installing on a board is still "copy pn7150.py to
+# CIRCUITPY/lib/" -- this file exists so the module can be built and published
+# (a prerequisite for the CircuitPython Community Bundle) and so the host-side
+# test suite can be run from a checkout.
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "circuitpython-pn7150"
+version = "1.2.0"
+description = "A friendlier CircuitPython driver for the NXP PN7150 NFC controller, with NDEF decoding and encoding built in"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.7"
+keywords = ["circuitpython", "nfc", "pn7150", "ndef", "rfid", "nxp", "mifare", "ntag", "felica", "iso15693"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/TheFilipcom4607/circuitpython-pn7150"
+Issues = "https://github.com/TheFilipcom4607/circuitpython-pn7150/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = ["pn7150"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
