@@ -14,12 +14,19 @@ Quick start::
             if tag.ndef:
                 print("  ->", tag.ndef.value)
 
+Or be the tag, so a phone tapped on the board opens a URL::
+
+    nfc.emulate_ndef("https://example.com")
+
 Design notes
 ------------
 * Everything raises a subclass of :class:`PN7150Error` instead of asserting.
 * :class:`Tag` objects know their own type and expose ``uid``/``ndef`` directly;
   tag-type specifics live in subclasses you rarely need to name yourself.
 * NDEF is parsed *and* built, so writing a URL to a tag is one call.
+* Card emulation is layered: :class:`Type4NDEFApplet` is a pure function of
+  bytes, :class:`CardEmulator` is the NCI session it rides on, and
+  :meth:`PN7150.emulate_ndef` wires the two together.
 * The bus defaults to 100 kHz. On boards without external I2C pull-ups (the
   iLabs Challenger RP2040 NFC among them) 400 kHz will not work.
 """
@@ -104,11 +111,15 @@ PROTOCOL_NAMES = {
     PROTOCOL_MIFARE: "MIFARE Classic",
 }
 
-# NCI RF technology and mode (poll modes only; this driver is reader/writer)
+# NCI RF technology and mode. Poll modes are 0x00-0x07; listen modes start at
+# 0x80. Only NFC-A listen is offered: iPhone Core NFC and Android both poll
+# ISO 14443 type A to read a tag, and UM10936 Table 8 records the NFC-B listen
+# parameter LB_H_INFO_RESP as unsupported anyway.
 TECH_NFC_A = const(0x00)
 TECH_NFC_B = const(0x01)
 TECH_NFC_F = const(0x02)
 TECH_NFC_V = const(0x06)
+TECH_NFC_A_LISTEN = const(0x80)
 
 TECH_NAMES = {
     TECH_NFC_A: "NFC-A",
@@ -117,7 +128,14 @@ TECH_NAMES = {
     0x03: "NFC-A (active)",
     0x05: "NFC-F (active)",
     TECH_NFC_V: "NFC-V",
+    TECH_NFC_A_LISTEN: "NFC-A (listen)",
+    0x81: "NFC-B (listen)",
+    0x82: "NFC-F (listen)",
 }
+
+#: RF_DISCOVER_MAP mode bits: which direction an entry maps.
+MODE_POLL = const(0x01)
+MODE_LISTEN = const(0x02)
 
 # NCI RF interfaces
 INTERFACE_FRAME = const(0x01)
@@ -132,6 +150,42 @@ INTERFACE_NAMES = {
     INTERFACE_NFC_DEP: "NFC-DEP",
     INTERFACE_TAG: "Tag/MIFARE",
 }
+
+# NCI 1.0 configuration parameter ids (cross-checked against nci_defs.h in
+# NXPNFCLinux/linux_libnfc-nci and Linux include/net/nfc/nci.h). The PN7150
+# defaults in UM10936 Table 8 are already right for all of these except
+# LA_SEL_INFO and RF_FIELD_INFO, which is why card emulation only sets those
+# two plus, optionally, an NFCID1.
+CFG_LA_BIT_FRAME_SDD = const(0x30)
+CFG_LA_PLATFORM_CONFIG = const(0x31)
+CFG_LA_SEL_INFO = const(0x32)
+CFG_LA_NFCID1 = const(0x33)
+CFG_LI_FWI = const(0x58)
+CFG_LA_HIST_BY = const(0x59)
+CFG_LI_BIT_RATE = const(0x5B)
+CFG_RF_FIELD_INFO = const(0x80)
+
+#: LA_SEL_INFO bit 5: "I support ISO-DEP", i.e. the SAK a reader gets back has
+#: bit 5 set and it will follow up with RATS. UM10936 Table 8 defaults this to
+#: 0x00 with the explicit note that it "has to be changed to emulate a card in
+#: DH with ISO-DEP/NFC-A" - without it no reader ever sends RATS.
+SEL_INFO_ISO_DEP = const(0x20)
+
+# NFC Forum Type 4 tag application, as used by both the reader half of this
+# driver and the emulated card. Values from the NFC Forum T4T spec and AOSP
+# tags_defs.h.
+NDEF_AID_V2 = b"\xd2\x76\x00\x00\x85\x01\x01"
+NDEF_AID_V1 = b"\xd2\x76\x00\x00\x85\x01\x00"
+FILE_ID_CC = b"\xe1\x03"
+FILE_ID_NDEF = b"\xe1\x04"
+
+SW_OK = b"\x90\x00"
+SW_FILE_NOT_FOUND = b"\x6a\x82"
+SW_WRONG_P1P2 = b"\x6b\x00"
+SW_NOT_ALLOWED = b"\x69\x86"
+SW_INS_NOT_SUPPORTED = b"\x6d\x00"
+SW_CLA_NOT_SUPPORTED = b"\x6e\x00"
+SW_WRONG_LENGTH = b"\x67\x00"
 
 STATUS_NAMES = {
     0x00: "OK",
@@ -443,6 +497,23 @@ def _to_str(data):
         return str(data, "utf-8")
     except (UnicodeError, ValueError):
         return "".join(chr(c) if 32 <= c < 127 else "." for c in data)
+
+
+def _as_ndef_message(message):
+    """Accept an :class:`NDEFMessage`, a record, or a plain string.
+
+    A string with a scheme becomes a URI record, anything else a text record -
+    the same coercion :meth:`Type4Tag.write_ndef` has always done, factored out
+    so the card emulator behaves identically.
+    """
+    if message is None or isinstance(message, NDEFMessage):
+        return message
+    if isinstance(message, str):
+        return NDEFMessage.from_uri(message) if "://" in message \
+            else NDEFMessage.from_text(message)
+    if isinstance(message, NDEFRecord):
+        return NDEFMessage([message])
+    return NDEFMessage(list(message))
 
 
 def _ndef_from_tlv(data):
@@ -937,9 +1008,7 @@ class Type4Tag(Tag):
         Not verified against physical hardware - no writable Type 4 tag was
         available. The read path in :meth:`read_ndef` is.
         """
-        if isinstance(message, str):
-            message = NDEFMessage.from_uri(message) if "://" in message \
-                else NDEFMessage.from_text(message)
+        message = _as_ndef_message(message)
         payload = message.to_bytes()
         if not self.select_ndef_application():
             raise NotSupportedError("no NDEF application on this card")
@@ -1593,6 +1662,30 @@ _PROP_ACT = b"\x2f\x02\x00"
 # Map every reader/writer protocol onto its RF interface.
 _DISCOVER_MAP_RW = (b"\x21\x00\x10\x05\x01\x01\x01\x02\x01\x01\x03\x01\x01"
                     b"\x04\x01\x02\x80\x01\x80")
+# ISO-DEP, listen mode, on the ISO-DEP RF interface. That interface is not
+# optional: UM10936 §7.1 Table 67 records the Frame RF interface for ISO-DEP as
+# "Not supported in PN7150", so the NFCC answers SENS_REQ/SDD/SEL/RATS/ATS/PPS
+# itself and the host only ever sees C-APDUs.
+_DISCOVER_MAP_CE = b"\x21\x00\x04\x01\x04\x02\x02"
+
+# RF_SET_LISTEN_MODE_ROUTING: one protocol-based route, ISO-DEP to the DH.
+_LISTEN_ROUTING = b"\x21\x01\x07\x00\x01\x01\x03\x00\x01\x04"
+
+
+def _map_command(poll=True, listen=False):
+    """The RF_DISCOVER_MAP command for the wanted mix of poll and listen.
+
+    The poll-only case returns :data:`_DISCOVER_MAP_RW` byte for byte, so
+    reader behaviour is exactly what hardware has already been run against.
+    """
+    if not listen:
+        return _DISCOVER_MAP_RW
+    if not poll:
+        return _DISCOVER_MAP_CE
+    body = _DISCOVER_MAP_RW[4:] + _DISCOVER_MAP_CE[4:]
+    n = _DISCOVER_MAP_RW[3] + _DISCOVER_MAP_CE[3]
+    return bytes([0x21, 0x00, len(body) + 1, n]) + body
+
 
 DEFAULT_TECHNOLOGIES = (TECH_NFC_A, TECH_NFC_B, TECH_NFC_F, TECH_NFC_V)
 
@@ -1647,8 +1740,30 @@ class PN7150:
         self._deinited = False
         self._connected = False
         self._discovering = False
-        self._mapped = False
+        #: The RF_DISCOVER_MAP bytes currently in force, or None. The map is
+        #: only settable in RFST_IDLE, so it is tracked rather than re-sent.
+        self._map_sent = None
         self._technologies = DEFAULT_TECHNOLOGIES
+        self._listen = False
+        #: Static RF connection state, from RF_INTF_ACTIVATED_NTF and
+        #: CORE_CONN_CREDITS_NTF. UM10936 Table 5: one connection, one credit,
+        #: max data payload in [32;255].
+        self._max_payload = 255
+        self._credits = 0
+        self._field = False
+        #: Sticky: an RF_DEACTIVATE_NTF has been seen and not yet acted on.
+        #: Set even when the frame is met inside _drain(), so a deactivation
+        #: that lands while a response is going out is never lost.
+        self._deactivated = False
+        #: Sticky in the same way: the last listen-mode RF_INTF_ACTIVATED_NTF,
+        #: for a CardEmulator to pick up. A reader that taps in the window
+        #: where _drain() is running would otherwise activate unnoticed, and
+        #: its first C-APDU would be answered by nobody.
+        self._listen_activation = None
+        #: Data packets carrying the packet-boundary flag, held between calls
+        #: to _read_data() so a segmented message split across two of them is
+        #: still reassembled rather than being seen as two short ones.
+        self._rx_partial = bytearray()
         self.protocol_preference = protocol_preference
         #: Candidates from the most recent multi-protocol discovery, as
         #: ``(discovery_id, protocol, technology, params)`` tuples.
@@ -1724,7 +1839,12 @@ class PN7150:
             if len(rsp) >= 8 and rsp[0] == 0x4F:
                 self.build_number = bytes(rsp[4:8])
         self._connected = True
-        self._mapped = False
+        self._map_sent = None
+        self._credits = 0
+        self._field = False
+        self._deactivated = False
+        self._listen_activation = None
+        self._rx_partial = bytearray()
         return True
 
     @property
@@ -1733,28 +1853,77 @@ class PN7150:
 
     # -- discovery -------------------------------------------------------
 
-    def start_discovery(self, technologies=DEFAULT_TECHNOLOGIES):
-        """Begin polling. Pass a subset of ``TECH_NFC_A/B/F/V`` to narrow it."""
+    def start_discovery(self, technologies=DEFAULT_TECHNOLOGIES, listen=False):
+        """Begin discovery.
+
+        Pass a subset of ``TECH_NFC_A/B/F/V`` to narrow the poll loop.
+        ``listen=True`` adds an NFC-A listen entry, so the controller also
+        answers a reader that comes looking for a card; poll and listen live in
+        one loop (UM10936 §9.2/§9.3 show RF_DISCOVER_CMD carrying both). Pass
+        ``technologies=()`` with ``listen=True`` for a listen-only loop.
+        """
         self._require_connection()
         self._technologies = technologies
+        self._listen = listen
         with _Bus(self._i2c):
-            self._ensure_map()
-            body = bytearray([len(technologies)])
-            for tech in technologies:
-                body += bytes([tech, 0x01])       # poll each once per loop
+            self._ensure_map(poll=bool(technologies), listen=listen)
+            entries = [(tech, 0x01) for tech in technologies]
+            if listen:
+                entries.append((TECH_NFC_A_LISTEN, 0x01))
+            body = bytearray([len(entries)])
+            for tech, count in entries:
+                body += bytes([tech, count])      # poll/listen once per loop
             self._send(bytes([0x21, 0x03, len(body)]) + bytes(body),
                        "RF_DISCOVER")
         self._discovering = True
         return True
 
-    def _ensure_map(self):
-        """Map protocols onto RF interfaces. Only valid in the idle state and
-        only needed once per reset -- re-sending it after every tag is what
-        produced SEMANTIC_ERROR when a slow card left the controller busy."""
-        if self._mapped:
+    def _ensure_map(self, poll=True, listen=False):
+        """Map protocols onto RF interfaces.
+
+        Only valid in the idle state, and only needed when the wanted map
+        differs from the one already in force -- re-sending it after every tag
+        is what produced SEMANTIC_ERROR when a slow card left the controller
+        busy. Switching between reader and card emulation does change it, so
+        drop to idle first in that case.
+        """
+        cmd = _map_command(poll, listen)
+        if self._map_sent == cmd:
             return
-        self._send(_DISCOVER_MAP_RW, "RF_DISCOVER_MAP")
-        self._mapped = True
+        if self._map_sent is not None:
+            self._deactivate(0x00)
+            self._drain()
+        self._send(cmd, "RF_DISCOVER_MAP")
+        self._map_sent = cmd
+
+    def set_config(self, params):
+        """CORE_SET_CONFIG. ``params`` is a sequence of ``(id, value)`` pairs.
+
+        Checks the status *and* the trailing list of parameters the controller
+        would not take, so a rejected NFCID1 says so instead of silently
+        leaving the chip in its default configuration.
+        """
+        self._require_connection()
+        if isinstance(params, dict):
+            params = sorted(params.items())
+        params = [(pid, bytes(value)) for pid, value in params]
+        body = bytearray([len(params)])
+        for pid, value in params:
+            body += bytes([pid, len(value)]) + value
+        cmd = bytes([0x20, 0x02, len(body)]) + bytes(body)
+        with _Bus(self._i2c):
+            rsp = self._command(cmd, timeout=0.5)
+        if len(rsp) < 5 or rsp[0] != 0x40 or rsp[1] != 0x02:
+            raise CommandError("CORE_SET_CONFIG: unexpected reply %s"
+                               % hexlify(rsp))
+        status = rsp[3]
+        n_invalid = rsp[4]
+        if n_invalid:
+            bad = ", ".join("0x%02x" % b for b in rsp[5:5 + n_invalid])
+            raise CommandError(
+                "the controller rejected config parameter(s) %s" % bad, status)
+        self._check_status(status, "CORE_SET_CONFIG")
+        return True
 
     def _send(self, cmd, what):
         """Send a control command, recovering once from a bad-state error.
@@ -1813,7 +1982,10 @@ class PN7150:
                         return None
                     continue
                 if pkt[0] == 0x61 and pkt[1] == 0x05:
-                    return self._build_tag(pkt)
+                    tag = self._build_tag(pkt)
+                    if tag is not None:
+                        return tag
+                    continue          # listen activation; not a tag we read
                 if pkt[0] == 0x61 and pkt[1] == 0x03:
                     # RF_DISCOVER_NTF. A card that offers more than one
                     # protocol is not activated automatically: the NFCC lists
@@ -1879,7 +2051,7 @@ class PN7150:
             self._deactivate(0x00)          # ctrl -> IDLE
             self._drain()
         self._discovering = False
-        self.start_discovery(self._technologies)
+        self.start_discovery(self._technologies, self._listen)
         return True
 
     def _select_candidate(self, candidates):
@@ -1916,7 +2088,7 @@ class PN7150:
         self._drain()
         self._discovering = False
         try:
-            self.start_discovery(self._technologies)
+            self.start_discovery(self._technologies, self._listen)
         except PN7150Error:
             pass
         return False
@@ -1929,10 +2101,41 @@ class PN7150:
         protocol = pkt[5]
         tech = pkt[6]
         max_payload = pkt[7] if len(pkt) > 7 else None
+        if tech >= 0x80:
+            # A listen-mode activation: a reader has selected *us*. There is no
+            # Tag to build - this belongs to a CardEmulator session.
+            self._note_activation(pkt)
+            return None
         params = pkt[10:]
         cls = _TAG_CLASSES.get(protocol, Tag)
         return cls(self, disc_id, interface, protocol, tech, params,
                    max_payload)
+
+    # -- card emulation --------------------------------------------------
+
+    def emulate_ndef(self, message, timeout=None, writable=False,
+                     on_read=None, on_write=None, max_size=1024,
+                     nfcid1=None, also_poll=False):
+        """Present this board to readers as a Type 4 tag holding ``message``.
+
+        ``nfc.emulate_ndef("https://example.com")`` is enough to make a phone
+        show the URL on tap. ``message`` is an :class:`NDEFMessage`, or a
+        string coerced the way :meth:`Type4Tag.write_ndef` coerces one.
+
+        Blocks until ``timeout`` seconds pass with no reader (forever by
+        default), then returns the :class:`Type4NDEFApplet` it was serving --
+        so after a ``writable=True`` session, ``applet.message`` is whatever
+        was written.
+        """
+        applet = Type4NDEFApplet(message, max_size=max_size, writable=writable,
+                                 on_read=on_read, on_write=on_write)
+        emulator = CardEmulator(self, nfcid1=nfcid1, also_poll=also_poll)
+        try:
+            emulator.start()
+            emulator.run(applet, timeout)
+        finally:
+            emulator.stop()
+        return applet
 
     # -- transport -------------------------------------------------------
 
@@ -1964,9 +2167,17 @@ class PN7150:
         return self._raw_read()
 
     def _drain(self):
-        """Throw away anything the controller still has queued."""
+        """Throw away anything the controller still has queued.
+
+        Control notifications are folded into the connection state on the way
+        out: a credit or a deactivation that happens to arrive while a frame is
+        being written is state, not junk, and dropping it silently is how a
+        card-emulation session goes deaf.
+        """
         while self._irq.value:
-            self._raw_read()
+            pkt = self._raw_read()
+            if pkt and pkt[0] & 0xE0 != 0x00:
+                self._handle_control(pkt)
 
     def _write_frame(self, data):
         self._drain()
@@ -1983,8 +2194,144 @@ class PN7150:
         return rsp
 
     #: Largest payload one NCI data packet can carry (the length field is a
-    #: single byte). Segmentation of longer payloads is not implemented.
+    #: single byte). The reader path does not segment past this and raises
+    #: instead; the card-emulation path does, because there the controller
+    #: segments whatever it likes anyway (UM10936 §2.3.4).
     MAX_PACKET_PAYLOAD = const(255)
+
+    def _note_activation(self, pkt):
+        """Seed the static RF connection state from RF_INTF_ACTIVATED_NTF.
+
+        Byte 7 is the largest data payload the NFCC will carry in one packet
+        and byte 8 the initial credit count -- one, on this chip.
+        """
+        if len(pkt) > 8:
+            self._max_payload = pkt[7] or 255
+            self._credits = pkt[8]
+        if len(pkt) > 6 and pkt[6] >= 0x80:
+            # Not clearing _deactivated here is deliberate: if the previous
+            # reader's deactivation has not been acted on yet, it is still owed
+            # a teardown -- the applet has selection state to forget -- and the
+            # session that ended must be reported before this one begins.
+            self._listen_activation = bytes(pkt)
+            self._rx_partial = bytearray()
+
+    def _handle_control(self, pkt):
+        """Fold one control notification into the connection state.
+
+        Returns a short name for what it was, or ``None`` for a notification
+        this driver does not track.
+        """
+        gid, oid = pkt[0], pkt[1]
+        if gid == 0x60 and oid == 0x06:           # CORE_CONN_CREDITS_NTF
+            n = pkt[3] if len(pkt) > 3 else 0
+            for i in range(n):
+                base = 4 + 2 * i
+                if len(pkt) > base + 1 and pkt[base] == 0x00:
+                    self._credits += pkt[base + 1]
+            return "credits"
+        if gid == 0x61 and oid == 0x07:           # RF_FIELD_INFO_NTF
+            self._field = bool(pkt[3]) if len(pkt) > 3 else False
+            return "field"
+        if gid == 0x61 and oid == 0x06:           # RF_DEACTIVATE_NTF
+            self._credits = 0
+            self._deactivated = True
+            return "deactivate"
+        if gid == 0x61 and oid == 0x05:           # RF_INTF_ACTIVATED_NTF
+            self._note_activation(pkt)
+            return "activated"
+        if gid == 0x60 and oid in (0x07, 0x08):   # GENERIC/INTERFACE_ERROR_NTF
+            return "error"
+        return None
+
+    def _read_data(self, timeout=0.5, events=None):
+        """Return one complete NCI data *message* from the static connection.
+
+        The NFCC "MAY segment the Data Message into smaller Data Packets"
+        whatever its length (UM10936 §2.3.4), so packets carrying the
+        packet-boundary flag are reassembled here rather than handed up one at
+        a time. Control notifications met on the way update the connection
+        state and are appended to ``events`` as ``(kind, packet)``.
+
+        ``None`` means no complete message arrived: either ``timeout`` seconds
+        passed or the link went away, and ``events`` says which.
+        """
+        deadline = _deadline(timeout)
+        with _Bus(self._i2c):
+            while True:
+                pkt = self._read_frame(0.02)
+                if pkt is None:
+                    if _expired(deadline):
+                        return None
+                    continue
+                if pkt[0] & 0xE0 == 0x00:              # data packet
+                    self._rx_partial += pkt[3:]
+                    if not pkt[0] & 0x10:              # last segment
+                        message = bytes(self._rx_partial)
+                        self._rx_partial = bytearray()
+                        return message
+                    deadline = _deadline(timeout)      # more is coming
+                    continue
+                kind = self._handle_control(pkt)
+                if events is not None:
+                    events.append((kind, pkt))
+                if kind == "deactivate" or kind == "error":
+                    # Half a message with no link left to finish it is junk.
+                    self._rx_partial = bytearray()
+                if kind in ("deactivate", "error", "activated"):
+                    return None
+
+    def _wait_for_credit(self, timeout=1.0, events=None):
+        """Block until the NFCC will accept another data packet.
+
+        There is exactly one credit on the static RF connection (UM10936
+        Table 5), so a segmented response has to wait for each
+        CORE_CONN_CREDITS_NTF before the next packet goes out.
+        """
+        if self._credits > 0:
+            return True
+        deadline = _deadline(timeout)
+        while True:
+            pkt = self._read_frame(0.02)
+            if pkt is None:
+                if _expired(deadline):
+                    return False
+                continue
+            if pkt[0] & 0xE0 == 0x00:
+                # Inbound data while we still owe a response. Nothing sane to
+                # do with it, but record it rather than swallow it silently.
+                if events is not None:
+                    events.append(("data", pkt))
+                continue
+            kind = self._handle_control(pkt)
+            if events is not None:
+                events.append((kind, pkt))
+            if kind == "deactivate":
+                raise TagLostError("the reader dropped the link mid-answer")
+            if self._credits > 0:
+                return True
+
+    def _send_data(self, payload, timeout=1.0, events=None):
+        """Send a data message, segmenting it and waiting for credits."""
+        payload = bytes(payload)
+        size = self._max_payload or 255
+        if size > self.MAX_PACKET_PAYLOAD:
+            size = self.MAX_PACKET_PAYLOAD
+        with _Bus(self._i2c):
+            offset = 0
+            while True:
+                chunk = payload[offset:offset + size]
+                offset += len(chunk)
+                last = offset >= len(payload)
+                if not self._wait_for_credit(timeout, events):
+                    raise TagTimeoutError(
+                        "the controller gave no credit for %d bytes"
+                        % len(payload))
+                self._write_frame(bytes([0x10 if not last else 0x00, 0x00,
+                                         len(chunk)]) + chunk)
+                self._credits -= 1
+                if last:
+                    return True
 
     def _exchange(self, payload, timeout=0.5):
         """Send a data packet to the activated tag and return its answer."""
@@ -2026,6 +2373,504 @@ class PN7150:
                         % (STATUS_NAMES.get(status, "an error"), status),
                         status)
                 # anything else is a notification we do not care about
+
+
+# ---------------------------------------------------------- card emulation
+#
+# The PN7150 runs the whole ISO-DEP stack in firmware: it answers SENS_REQ,
+# SDD, SEL, RATS, ATS and PPS itself and hands the host bare C-APDUs on the
+# ISO-DEP RF interface. Emulating a Type 4 tag is therefore a matter of
+# answering APDUs, not of driving a protocol.
+
+
+def _parse_apdu(c_apdu):
+    """Split a short-form ISO 7816-4 command into its fields.
+
+    Returns ``(cla, ins, p1, p2, data, le)`` with ``le`` ``None`` when the
+    command carries no Le byte, or ``None`` if the frame is not a well-formed
+    short-form APDU.
+
+    Parsing structurally rather than comparing whole commands against fixed
+    byte strings (as NXP's T4T_NDEF_emu.c does) is what makes this indifferent
+    to whichever of the two accepted SELECT forms a reader sends, and to any
+    trailing byte the RF interface might append.
+    """
+    c_apdu = bytes(c_apdu)
+    if len(c_apdu) < 4:
+        return None
+    cla, ins, p1, p2 = c_apdu[0], c_apdu[1], c_apdu[2], c_apdu[3]
+    body = c_apdu[4:]
+    if not body:
+        return (cla, ins, p1, p2, b"", None)
+    if len(body) == 1:
+        return (cla, ins, p1, p2, b"", body[0])
+    lc = body[0]
+    if lc == 0 or len(body) < 1 + lc or len(body) > 2 + lc:
+        return None                      # extended length, or simply malformed
+    le = body[1 + lc] if len(body) == 2 + lc else None
+    return (cla, ins, p1, p2, body[1:1 + lc], le)
+
+
+class Type4NDEFApplet:
+    """The NFC Forum Type 4 tag application, as a pure function of bytes.
+
+    :meth:`process` turns a C-APDU into an R-APDU and does no I/O at all, so
+    the whole state machine runs on the desktop -- in the tests it is driven by
+    this driver's own :class:`Type4Tag` reader, two independent implementations
+    of the same spec checking each other.
+
+    ``max_size`` is what the capability container advertises as the NDEF file's
+    capacity; a message that does not fit raises :class:`NDEFError` rather than
+    being served truncated. The tag is read-only unless ``writable=True``.
+
+    ``on_read`` fires with the message once a reader has read through its last
+    byte; ``on_write`` fires with the new message once a complete one has been
+    written.
+    """
+
+    def __init__(self, message=None, max_size=1024, writable=False,
+                 on_read=None, on_write=None):
+        if max_size < 3 or max_size > 0xFFFE:
+            raise ValueError("max_size must be in [3;65534], not %d" % max_size)
+        self._max_size = max_size
+        self.writable = writable
+        self.on_read = on_read
+        self.on_write = on_write
+        self._message = None
+        self._payload = b""
+        self.message = message
+        self.reset()
+
+    # -- state -----------------------------------------------------------
+
+    def reset(self):
+        """Forget the selection state. Called on every deactivation: the next
+        reader starts from nothing selected, as a real card would."""
+        self._selected_app = False
+        self._file = None
+        self._write_buf = None
+        self._read_fired = False
+
+    @property
+    def max_size(self):
+        return self._max_size
+
+    @property
+    def message(self):
+        """The :class:`NDEFMessage` currently served, or ``None``."""
+        return self._message
+
+    @message.setter
+    def message(self, message):
+        message = _as_ndef_message(message)
+        payload = b"" if message is None else message.to_bytes()
+        if len(payload) + 2 > self._max_size:
+            raise NDEFError(
+                "message needs %d bytes but the emulated NDEF file holds %d"
+                % (len(payload) + 2, self._max_size - 2))
+        self._message = message
+        self._payload = payload
+        self._write_buf = None
+        self._read_fired = False
+
+    @property
+    def capability_container(self):
+        """The 15-byte CC this tag serves.
+
+        ``00 0F`` CCLEN, ``20`` mapping version 2.0, ``00 FF`` MLe, ``00 FF``
+        MLc, then the NDEF File Control TLV: ``04 06``, file id ``E1 04``, the
+        maximum file size, read access ``00`` and write access ``00``
+        (writable) or ``FF`` (read only).
+        """
+        return (b"\x00\x0f\x20\x00\xff\x00\xff\x04\x06" + FILE_ID_NDEF
+                + bytes([(self._max_size >> 8) & 0xFF, self._max_size & 0xFF,
+                         0x00, 0x00 if self.writable else 0xFF]))
+
+    @property
+    def ndef_file(self):
+        """The NDEF file as a reader sees it: NLEN big-endian, then the
+        message."""
+        return bytes([(len(self._payload) >> 8) & 0xFF,
+                      len(self._payload) & 0xFF]) + self._payload
+
+    # -- the command handler ---------------------------------------------
+
+    def process(self, c_apdu):
+        """Turn one C-APDU into its R-APDU. Never raises on bad input."""
+        parsed = _parse_apdu(c_apdu)
+        if parsed is None:
+            return SW_WRONG_LENGTH
+        cla, ins, p1, p2, data, le = parsed
+        if cla != 0x00:
+            return SW_CLA_NOT_SUPPORTED
+        if ins == 0xA4:
+            return self._select(p1, p2, data)
+        if ins == 0xB0:
+            return self._read_binary(p1, p2, le)
+        if ins == 0xD6:
+            return self._update_binary(p1, p2, data)
+        return SW_INS_NOT_SUPPORTED
+
+    def _select(self, p1, p2, data):
+        if p1 == 0x04:                                   # select by name (AID)
+            if data == NDEF_AID_V2 or data == NDEF_AID_V1:
+                self._selected_app = True
+                self._file = None
+                return SW_OK
+            return SW_FILE_NOT_FOUND
+        if p1 == 0x00:                                   # select by file id
+            if not self._selected_app:
+                return SW_NOT_ALLOWED
+            if data == FILE_ID_CC:
+                self._file = "cc"
+                return SW_OK
+            if data == FILE_ID_NDEF:
+                self._file = "ndef"
+                return SW_OK
+            return SW_FILE_NOT_FOUND
+        return SW_FILE_NOT_FOUND
+
+    def _selected_content(self):
+        if self._file == "cc":
+            return self.capability_container
+        if self._file == "ndef":
+            if self._write_buf is not None:
+                return bytes(self._write_buf)
+            return self.ndef_file
+        return None
+
+    def _read_binary(self, p1, p2, le):
+        content = self._selected_content()
+        if content is None:
+            return SW_NOT_ALLOWED
+        offset = (p1 << 8) | p2
+        if offset >= len(content):
+            return SW_WRONG_P1P2
+        count = 256 if le is None or le == 0 else le     # Le == 0 means 256
+        chunk = content[offset:offset + count]
+        if (self._file == "ndef" and self.on_read is not None
+                and not self._read_fired and self._payload
+                and offset + len(chunk) >= 2 + len(self._payload)):
+            self._read_fired = True
+            self.on_read(self._message)
+        return chunk + SW_OK
+
+    def _update_binary(self, p1, p2, data):
+        if not self.writable:
+            return SW_NOT_ALLOWED
+        if self._file != "ndef":
+            return SW_NOT_ALLOWED
+        offset = (p1 << 8) | p2
+        end = offset + len(data)
+        if end > self._max_size:
+            return SW_WRONG_P1P2
+        if self._write_buf is None:
+            self._write_buf = bytearray(self.ndef_file)
+        buf = self._write_buf
+        if end > len(buf):
+            buf += bytes(end - len(buf))
+        buf[offset:end] = data
+        # The NFC Forum write flow zeroes NLEN, writes the message, then writes
+        # the real NLEN last -- the same order Type4Tag.write_ndef() uses. So a
+        # non-zero NLEN with the whole message present means the write is done.
+        nlen = (buf[0] << 8) | buf[1]
+        if nlen and len(buf) >= 2 + nlen:
+            try:
+                message = NDEFMessage.from_bytes(bytes(buf[2:2 + nlen]))
+            except (NDEFError, IndexError):
+                return SW_OK                  # keep the bytes, publish nothing
+            self._message = message
+            self._payload = bytes(buf[2:2 + nlen])
+            self._write_buf = None
+            self._read_fired = False
+            if self.on_write is not None:
+                self.on_write(message)
+        return SW_OK
+
+
+class CardEmulator:
+    """A raw ISO-DEP card-emulation session: C-APDUs in, R-APDUs out.
+
+    The controller does the protocol; this drives the NCI side of it -- the
+    listen-mode interface map, the two configuration parameters the PN7150
+    needs before any reader will talk to it, and the data connection.
+
+    ``nfcid1`` sets the UID the emulated card shows (4, 7 or 10 bytes; a
+    leading ``0x08`` is the NFC Forum's "this UID is random" prefix). Left
+    ``None``, the controller's own default is used. ``also_poll=True`` keeps
+    the reader/writer poll loop running alongside, so one loop both reads tags
+    and answers phones.
+    """
+
+    def __init__(self, nfc, nfcid1=None, sel_info=SEL_INFO_ISO_DEP,
+                 hist_bytes=b"", also_poll=False,
+                 technologies=DEFAULT_TECHNOLOGIES, on_tag=None):
+        if nfcid1 is not None:
+            nfcid1 = bytes(nfcid1)
+            if len(nfcid1) not in (4, 7, 10):
+                raise ValueError("an NFCID1 is 4, 7 or 10 bytes, not %d"
+                                 % len(nfcid1))
+        self._nfc = nfc
+        self.nfcid1 = nfcid1
+        self.sel_info = sel_info
+        self.hist_bytes = bytes(hist_bytes)
+        self.also_poll = also_poll
+        self._technologies = technologies
+        #: Called with a :class:`Tag` when ``also_poll`` is on and the poll
+        #: half of the loop finds one.
+        self.on_tag = on_tag
+        #: Status the controller returned for RF_SET_LISTEN_MODE_ROUTING, or
+        #: ``None`` if it refused to answer at all. Non-fatal either way.
+        self.routing_status = None
+        #: The RF_INTF_ACTIVATED_NTF of the current session.
+        self.activation = None
+        #: Why the last :meth:`next_apdu` returned ``None``.
+        self.last_event = None
+        self.tag = None
+        self._started = False
+        self._active = False
+        self._ended = False
+
+    # -- lifecycle -------------------------------------------------------
+
+    def start(self):
+        """Configure listen mode and begin discovery.
+
+        Order follows UM10936 Fig 49: interface map, then the configuration
+        parameters, then listen-mode routing, then RF_DISCOVER.
+        """
+        nfc = self._nfc
+        nfc._require_connection()
+        with _Bus(nfc._i2c):
+            nfc._ensure_map(poll=self.also_poll, listen=True)
+            # LA_SEL_INFO is the one that matters: UM10936 Table 8 defaults it
+            # to 0x00 and warns it "has to be changed to emulate a card in DH
+            # with ISO-DEP/NFC-A". Without bit 5 the SAK says "not ISO-DEP" and
+            # no reader ever sends RATS.
+            nfc.set_config([(CFG_LA_SEL_INFO, bytes([self.sel_info]))])
+            if self.nfcid1:
+                nfc.set_config([(CFG_LA_NFCID1, self.nfcid1)])
+            if self.hist_bytes:
+                nfc.set_config([(CFG_LA_HIST_BY, self.hist_bytes)])
+            # Field on/off notifications: how field_present knows, and how a
+            # phone leaving is noticed even without a deactivation.
+            nfc.set_config([(CFG_RF_FIELD_INFO, b"\x01")])
+            self.routing_status = self._set_listen_routing()
+            nfc._credits = 0
+            nfc._field = False
+            nfc._deactivated = False
+            nfc._listen_activation = None
+            nfc._rx_partial = bytearray()
+        nfc.start_discovery(self._technologies if self.also_poll else (),
+                            listen=True)
+        self._started = True
+        self._active = False
+        self._ended = False
+        return True
+
+    def _set_listen_routing(self):
+        """RF_SET_LISTEN_MODE_ROUTING, and do not care whether it works.
+
+        UM10936 contradicts itself here: Table 6 lists the command as "Not
+        supported" and §2.2 says the DH-NFCEE is the only route there is, yet
+        Fig 49 puts it in the card-emulation sequence and NXP's own reference
+        driver requires STATUS_OK from it. So send it, and treat any answer as
+        good enough.
+        """
+        try:
+            rsp = self._nfc._command(_LISTEN_ROUTING, timeout=0.5)
+        except (CommandError, TagTimeoutError):
+            return None
+        if len(rsp) >= 4 and rsp[0] == 0x41 and rsp[1] == 0x01:
+            return rsp[3]
+        return None
+
+    def stop(self):
+        """Leave listen mode and return the controller to idle."""
+        if not self._started:
+            return False
+        self._started = False
+        self._active = False
+        nfc = self._nfc
+        if nfc.connected:
+            with _Bus(nfc._i2c):
+                nfc._deactivate(0x00)
+                nfc._drain()
+            nfc._deactivated = False
+            nfc._listen_activation = None
+            nfc._rx_partial = bytearray()
+        nfc._discovering = False
+        return True
+
+    def _restart(self):
+        """Recover after a reader leaves.
+
+        Not RF_DEACTIVATE(Sleep): UM10936 §9.1 says the PN7150 "does not accept
+        the RF_DEACTIVATE_CMD(Sleep Mode) ... in RFST_LISTEN_ACTIVE or
+        RFST_LISTEN_SLEEP", because it has no Frame RF interface for listen
+        mode. Deactivate to idle, then re-issue RF_DISCOVER -- the listen-side
+        twin of the dance resume_discovery() already does for readers.
+        """
+        nfc = self._nfc
+        nfc._deactivated = False
+        self._active = False
+        if not self._started or not nfc.connected:
+            return False
+        if nfc._listen_activation is not None:
+            # A reader activated us again while the last session was being torn
+            # down. The discovery loop is already live; re-issuing RF_DISCOVER
+            # here would drop the reader that is standing on the antenna now.
+            return True
+        nfc.resume_discovery(sleep_tag=False)
+        return True
+
+    # -- state -----------------------------------------------------------
+
+    @property
+    def field_present(self):
+        """``True`` while a reader's RF field is on us."""
+        return self._nfc._field
+
+    @property
+    def reader_active(self):
+        """``True`` between activation and deactivation, i.e. while a reader
+        has this card selected and may send APDUs."""
+        return self._active
+
+    # -- the session -----------------------------------------------------
+
+    def wait_for_reader(self, timeout=None):
+        """Block until a reader activates this card. ``False`` on timeout."""
+        if not self._started:
+            self.start()
+        deadline = None if timeout is None else _deadline(timeout)
+        while True:
+            self._take_activation()
+            if self._active:
+                return True
+            if deadline is not None and _expired(deadline):
+                return False
+            events = []
+            self._nfc._read_data(0.1, events)
+            self._fold(events)
+
+    def next_apdu(self, timeout=None):
+        """The next C-APDU from the reader.
+
+        ``None`` means there is nothing to answer: the reader deactivated us,
+        or ``timeout`` seconds passed. :attr:`last_event` says which.
+        """
+        if not self._started:
+            self.start()
+        deadline = None if timeout is None else _deadline(timeout)
+        while True:
+            # Order matters: finish tearing down the session that ended before
+            # claiming a new activation, or a reader that arrives during the
+            # teardown gets its own loop restarted out from under it.
+            if self._nfc._deactivated:
+                self._nfc._deactivated = False
+                self._ended = self._ended or self._active
+                self._active = False
+            if self._ended:
+                self._ended = False
+                self.activation = None
+                self.last_event = "deactivated"
+                self._restart()
+                return None
+            self._take_activation()
+            if self.tag is not None:
+                self._serve_tag()
+                continue
+            events = []
+            data = self._nfc._read_data(0.1, events)
+            self._fold(events)
+            if data is not None and self._active:
+                self.last_event = "apdu"
+                return data
+            if self._ended or self._nfc._deactivated:
+                continue                      # handled at the top of the loop
+            if deadline is not None and _expired(deadline):
+                self.last_event = "timeout"
+                return None
+
+    def respond(self, r_apdu):
+        """Send an R-APDU back. ``False`` if the reader went away first."""
+        try:
+            self._nfc._send_data(bytes(r_apdu))
+        except (TagLostError, TagTimeoutError, CommandError):
+            self._ended = self._active
+            self._active = False
+            return False
+        return True
+
+    def run(self, handler, timeout=None):
+        """Answer readers until ``timeout`` seconds pass with nothing to do.
+
+        ``handler`` is either a callable taking a C-APDU and returning an
+        R-APDU, or an object with a ``process()`` method (and optionally a
+        ``reset()``, called on every deactivation) -- which is exactly the
+        shape of :class:`Type4NDEFApplet`. Returns how many APDUs were served.
+        """
+        process = getattr(handler, "process", handler)
+        reset = getattr(handler, "reset", None)
+        if not self._started:
+            self.start()
+        served = 0
+        while True:
+            c_apdu = self.next_apdu(timeout)
+            if c_apdu is None:
+                if reset is not None:
+                    reset()
+                if self.last_event == "timeout":
+                    return served
+                continue                     # a reader left; wait for the next
+            r_apdu = process(c_apdu)
+            served += 1
+            if r_apdu:
+                self.respond(r_apdu)
+
+    # -- internals -------------------------------------------------------
+
+    def _fold(self, events):
+        """Update the session from the control frames _read_data dispatched.
+
+        Listen activations arrive through the driver's sticky
+        ``_listen_activation`` rather than from ``events``, so one met inside
+        _drain() -- where there is no events list to append to -- still starts
+        the session.
+        """
+        for kind, pkt in events:
+            if kind == "activated" and len(pkt) > 6 and pkt[6] < 0x80:
+                self.tag = self._nfc._build_tag(pkt)
+            elif kind == "deactivate":
+                self._ended = self._ended or self._active
+                self._active = False
+                self._nfc._deactivated = False
+
+    def _take_activation(self):
+        """Claim a listen activation the driver has recorded, if any.
+
+        Deliberately does not clear :attr:`_ended`: a session that ended is
+        reported first, and only then is the next reader picked up.
+        """
+        pkt = self._nfc._listen_activation
+        if pkt is None:
+            return False
+        self._nfc._listen_activation = None
+        self.activation = pkt
+        self._active = True
+        return True
+
+    def _serve_tag(self):
+        """Hand a poll-mode activation to on_tag, then go back to listening."""
+        tag = self.tag
+        self.tag = None
+        if self.on_tag is not None:
+            try:
+                self.on_tag(tag)
+            except PN7150Error:
+                pass
+        self._nfc.resume_discovery(sleep_tag=True)
 
 
 def _parse_discover_ntf(pkt):

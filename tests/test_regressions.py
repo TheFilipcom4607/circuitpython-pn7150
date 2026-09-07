@@ -295,7 +295,7 @@ def _driver_with_frames(frames):
     nfc = pn7150.PN7150(scl="scl", sda="sda", irq="irq", ven="ven")
     nfc._connected = True
     nfc._discovering = True
-    nfc._mapped = True
+    nfc._map_sent = pn7150._DISCOVER_MAP_RW
     sent = []
     queue = list(frames)
 
@@ -356,7 +356,7 @@ def test_failed_selection_returns_to_polling():
     nfc = pn7150.PN7150(scl="scl", sda="sda", irq="irq", ven="ven")
     nfc._connected = True
     nfc._discovering = True
-    nfc._mapped = True          # as it is after a real connect()
+    nfc._map_sent = pn7150._DISCOVER_MAP_RW   # as it is after start_discovery()
     sent = []
     queue = [DISCOVER_NTF_ISO_DEP, DISCOVER_NTF_MIFARE]
 

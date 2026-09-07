@@ -1,8 +1,8 @@
 # On-device unit tests: run every pure-logic path under CircuitPython,
 # where CPython-only behaviour (int-in-bytearray, etc.) actually shows up.
 import pn7150
-from pn7150 import (NDEFMessage, NDEFRecord, Tag, Type2Tag, hexlify,
-                    TECH_NFC_A, TECH_NFC_B, TECH_NFC_F, TECH_NFC_V)
+from pn7150 import (NDEFMessage, NDEFRecord, Tag, Type2Tag, Type4NDEFApplet,
+                    hexlify, TECH_NFC_A, TECH_NFC_B, TECH_NFC_F, TECH_NFC_V)
 
 passed = failed = 0
 
@@ -409,6 +409,81 @@ check("mfc write_ndef round trips", _t2.read_ndef() == _msg, True)
 check_raises("mfc refuses an oversized message",
              lambda: FakeWritableMFC().write_ndef(NDEFMessage(
                  [NDEFRecord.mime("application/x", bytes(45 * 16))])),
+             pn7150.NDEFError)
+
+print("--- Type 4 card emulation applet ---")
+SEL_APP = b"\x00\xa4\x04\x00\x07\xd2\x76\x00\x00\x85\x01\x01\x00"
+SEL_APP_V1 = b"\x00\xa4\x04\x00\x07\xd2\x76\x00\x00\x85\x01\x00"
+SEL_CC = b"\x00\xa4\x00\x0c\x02\xe1\x03"
+SEL_NDEF = b"\x00\xa4\x00\x0c\x02\xe1\x04"
+_msg4 = NDEFMessage([NDEFRecord.uri("https://example.com"),
+                     NDEFRecord.text("hello", "en")])
+
+def applet(**kw):
+    a = Type4NDEFApplet(_msg4, **kw)
+    a.process(SEL_APP)
+    return a
+
+check("t4 selects the v2.0 aid", Type4NDEFApplet(None).process(SEL_APP),
+      b"\x90\x00")
+check("t4 selects the v1.0 aid", Type4NDEFApplet(None).process(SEL_APP_V1),
+      b"\x90\x00")
+check("t4 refuses an unknown aid",
+      Type4NDEFApplet(None).process(b"\x00\xa4\x04\x00\x02\xa0\x00\x00"),
+      b"\x6a\x82")
+check("t4 refuses a file before the app",
+      Type4NDEFApplet(None).process(SEL_CC), b"\x69\x86")
+check("t4 refuses an unknown file",
+      applet().process(b"\x00\xa4\x00\x0c\x02\xe1\x05"), b"\x6a\x82")
+check("t4 cc is 15 bytes", len(applet().capability_container), 15)
+check("t4 cc says read only", applet().capability_container[14], 0xFF)
+check("t4 cc says writable",
+      applet(writable=True).capability_container[14], 0x00)
+check("t4 cc carries the declared size",
+      hexlify(applet(max_size=512).capability_container[11:13]), "02:00")
+
+_a = applet()
+_a.process(SEL_CC)
+check("t4 reads the cc", _a.process(b"\x00\xb0\x00\x00\x0f"),
+      _a.capability_container + b"\x90\x00")
+check("t4 read past eof", _a.process(b"\x00\xb0\x00\x0f\x01"), b"\x6b\x00")
+
+_a = applet()
+_a.process(SEL_NDEF)
+_len4 = len(_msg4.to_bytes())
+check("t4 nlen matches the message",
+      _a.process(b"\x00\xb0\x00\x00\x02")[:2],
+      bytes([(_len4 >> 8) & 0xFF, _len4 & 0xFF]))
+check("t4 ndef file round trips",
+      NDEFMessage.from_bytes(_a.process(b"\x00\xb0\x00\x02\x00")[:-2]),
+      _msg4)
+check("t4 update binary needs writable",
+      _a.process(b"\x00\xd6\x00\x00\x02\x00\x00"), b"\x69\x86")
+check("t4 unknown instruction",
+      _a.process(b"\x00\xca\x00\x00\x00"), b"\x6d\x00")
+check("t4 foreign class byte",
+      _a.process(b"\x80\xb0\x00\x00\x02"), b"\x6e\x00")
+check("t4 truncated apdu", _a.process(b"\x00\xa4\x04"), b"\x67\x00")
+_a.reset()
+check("t4 reset forgets the selection",
+      _a.process(b"\x00\xb0\x00\x00\x02"), b"\x69\x86")
+
+_written = []
+_w = Type4NDEFApplet(None, writable=True, on_write=_written.append)
+_w.process(SEL_APP)
+_w.process(SEL_NDEF)
+_payload = _msg4.to_bytes()
+_w.process(b"\x00\xd6\x00\x00\x02\x00\x00")
+_w.process(bytes([0x00, 0xD6, 0x00, 0x02, len(_payload)]) + _payload)
+check("t4 publishes nothing before nlen", _written, [])
+_w.process(bytes([0x00, 0xD6, 0x00, 0x00, 0x02,
+                  len(_payload) >> 8, len(_payload) & 0xFF]))
+check("t4 write round trips", _w.message, _msg4)
+check("t4 on_write fired once", len(_written), 1)
+check_raises("t4 refuses a message the cc cannot hold",
+             lambda: Type4NDEFApplet(
+                 NDEFMessage([NDEFRecord.mime("application/x", bytes(64))]),
+                 max_size=32),
              pn7150.NDEFError)
 
 print()

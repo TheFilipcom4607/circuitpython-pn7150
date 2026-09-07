@@ -6,7 +6,9 @@ NDEF decoding and encoding built in. Written for the
 but not tied to it — any board with I2C plus two GPIOs will do.
 
 Reads NTAG/Ultralight, Mifare Classic, DESFire/ISO-DEP, ISO15693 and FeliCa;
-decodes and writes NDEF; and reports UIDs for all four RF technologies.
+decodes and writes NDEF; and reports UIDs for all four RF technologies. It also
+goes the other way — `nfc.emulate_ndef("https://…")` makes the board itself
+look like a Type 4 tag, so tapping a phone on it opens a URL.
 
 ## Install
 
@@ -78,6 +80,7 @@ stops at "a tag was seen":
 | Mifare Classic | none | authenticate, block read *and* write, NDEF |
 | ISO15693 | none | block reads + NDEF |
 | FeliCa / Type 3 | none | CHECK, attribute block, NDEF |
+| Card emulation | none | Type 4 tag: `nfc.emulate_ndef("https://…")` |
 | Type 4 / Type 5 NDEF writing | none | `write_ndef()` (unverified, see below) |
 | Presence / removal | none | `is_present()`, `wait_for_removal()` |
 | Errors | bare `assert` | `PN7150Error` hierarchy |
@@ -166,6 +169,57 @@ directly: `NDEFMessage.from_bytes(msg.to_bytes()) == msg`.
 
 All 36 URI prefix codes are handled, so `tel:+48…` and `https://…` both
 round-trip to their short form on the tag.
+
+### Card emulation
+
+The board can *be* the tag. The PN7150 runs the whole ISO-DEP stack in
+firmware — it answers SENS_REQ, SDD, SEL, RATS, ATS and PPS itself and hands
+the host bare APDUs — so presenting a Type 4 NDEF tag to a phone is one call:
+
+```python
+nfc.emulate_ndef("https://example.com")        # blocks; tap a phone
+```
+
+Tap an Android phone or an iPhone (XS and later, background tag reading) and
+the URL comes up as a notification banner. `message` takes an `NDEFMessage` or
+a string, coerced exactly as `write_ndef()` coerces one.
+
+```python
+applet = nfc.emulate_ndef(NDEFMessage.from_text("hello"),
+                          timeout=30,          # give up after 30s of quiet
+                          writable=True,       # let the phone write back
+                          on_read=lambda m: print("read", m.value),
+                          on_write=lambda m: print("wrote", m.value))
+print(applet.message)                          # whatever it now holds
+```
+
+Two lower layers are public, so you are not stuck with NDEF:
+
+* `CardEmulator(nfc, nfcid1=None, sel_info=SEL_INFO_ISO_DEP, hist_bytes=b"",
+  also_poll=False, on_tag=None)` — a raw APDU session.
+  `start()` / `stop()`, `wait_for_reader(timeout)`, `next_apdu(timeout)`,
+  `respond(r_apdu)`, `run(handler, timeout)`, and the `field_present` /
+  `reader_active` properties. `next_apdu()` returns `None` when the reader
+  leaves; `last_event` says whether that was a deactivation or a timeout.
+* `Type4NDEFApplet(message, max_size=1024, writable=False, on_read=None,
+  on_write=None)` — `process(c_apdu) -> r_apdu`, a pure function of bytes with
+  no I/O at all, so the whole Type 4 state machine is testable on the desktop.
+
+`also_poll=True` keeps the reader/writer poll loop running alongside listen
+mode, so one loop both reads tags and answers phones:
+
+```python
+emulator = CardEmulator(nfc, also_poll=True, on_tag=lambda tag: print(tag))
+emulator.start()
+emulator.run(Type4NDEFApplet("https://example.com"))
+```
+
+`nfcid1=` sets the UID the emulated card shows (4, 7 or 10 bytes; a leading
+`0x08` is the NFC Forum's "this UID is random" prefix). Left out, the
+controller's own default is used.
+
+See [`examples/emulate_ndef.py`](examples/emulate_ndef.py) and
+[`examples/reader_and_card.py`](examples/reader_and_card.py).
 
 ### Errors
 
@@ -258,6 +312,9 @@ Other things worth knowing, all learned the hard way:
 | `CommandError ... status 0x03` on Mifare | Wrong key, or a *second* authentication in one tap. Lift the tag and re-present it. |
 | The same tag is reported over and over | `skip_repeats=False`. That is the deliberate setting for `badge_reader.py`. |
 | `tag.ndef` is `None` on a tag you know holds data | Turn on `debug=True` and look at the frames; for Mifare, the data may live under a key other than `KEY_NDEF`. |
+| A phone never notices the emulated tag | `LA_SEL_INFO` did not take, so the SAK does not advertise ISO-DEP and the phone never sends RATS. `debug=True`: the bring-up must contain `20 02 04 01 32 01 20`. |
+| The emulated tag works for one tap, then nothing | Something sent `RF_DEACTIVATE(Sleep)` in a listen state, which the PN7150 refuses (UM10936 §9.1). Recovery is idle then `RF_DISCOVER`; `CardEmulator` does that itself. |
+| A phone sees the tag but reads nothing | The applet answered `6A82`/`6986`. `Type4NDEFApplet.process()` runs on the desktop — replay the C-APDUs from `debug=True` against it. |
 
 ## Known limitations
 
@@ -266,13 +323,21 @@ Other things worth knowing, all learned the hard way:
   because that means writing sector trailers and a trailer with the wrong
   access bits locks its sector permanently. Sector trailers are refused unless
   you pass `force=True`.
-* **No NCI segmentation.** One packet carries at most 255 bytes, and payloads
-  over that raise `ValueError` rather than being split.
+* **No NCI segmentation on the reader path.** `Tag.transceive()` carries at
+  most 255 bytes in one packet and raises `ValueError` past that. The card
+  emulation path *does* segment and reassemble, because the controller
+  segments whatever it likes there (UM10936 §2.3.4).
 * Pages 0–3 of a Type 2 tag are never written, so a factory-blank tag with no
   capability container is not made NDEF-ready.
 * **No Mifare MAD parsing.** `read_ndef()` walks the sectors under the NFC
   Forum key rather than consulting the application directory.
-* **Reader/writer mode only.** No card emulation, no peer-to-peer.
+* **Card emulation is NFC-A and Type 4 only.** One reader at a time, no
+  FeliCa/Type 3 emulation, and no peer-to-peer. NFC-B listen would mean the
+  whole `LB_*` configuration block for nothing: iPhone Core NFC and Android
+  both poll ISO 14443 type A to read a tag, and UM10936 Table 8 records
+  `LB_H_INFO_RESP` as unsupported anyway.
+* **An emulated tag is not persistent.** It exists while `emulate_ndef()` or
+  `CardEmulator.run()` is running; there is no offline card mode.
 * **`wait_for_tag()` busy-waits on the IRQ pin**, so it does not cooperate with
   `asyncio`. Poll with a short `timeout=` if you need to share the CPU.
 
@@ -319,24 +384,55 @@ parts most likely to still have a bug:
 
 | Path | Why untested |
 |---|---|
+| Card emulation, all of it | written against the manual, not yet taken to a phone |
 | `Type4Tag.write_ndef()`, `update_binary()` | no writable Type 4 tag |
 | `Type5Tag.write_block()`, `write_ndef()` | no writable ISO15693 tag |
 | 8-byte Type 5 capability container | no tag over 2040 bytes; unit-tested only |
 | Mifare Classic 4K geometry | no 4K card; the sector maths is unit-tested |
 | `Type3Tag.read_ndef()` | no FeliCa carrying NDEF; synthetic card only |
 
+Card emulation has never met a phone. What it *has* met, in
+[`tests/test_emulation.py`](tests/test_emulation.py), is a fake NFCC on the I2C
+stub: `connect()`, the listen bring-up, activation, a whole tap's worth of
+APDUs with the responses segmented and credit-gated, deactivation, and a second
+tap afterwards — all through the driver's real transport. The reader half of
+this driver plays the phone, so the C-APDUs are not invented. The list to work
+through on hardware is: a phone showing the URL, a second phone without a power
+cycle, `writable=True` from Android's NFC Tools, and `also_poll=True` reading
+an NTAG and answering a phone in one loop.
+
+### A suspected bug in the Type 4 *reader*
+
+Found while reading the two sides against each other, not yet confirmed on
+hardware, so nothing has been changed. [`Type4Tag.apdu()`](pn7150.py) runs its
+response through `_split_status()`, which strips a trailing NCI status byte.
+That byte is real for the Frame and TAG-CMD interfaces — the measured table
+above covers Type 2, MIFARE and ISO15693, all of which use those — but NCI puts
+the bare APDU on the **ISO-DEP** interface, and both AOSP `rw_t4t.c` and
+`ce_t4t.c` read SW1/SW2 as the last two payload bytes with nothing stripped.
+With the extra strip, a card answering `90 00` is one byte short of an APDU and
+`select_ndef_application()` returns `False` — which is exactly the hardware
+result recorded above: *"ISO-DEP ×6 | no NDEF application"*.
+
+Confirm it in one tap with `debug=True`: a 2-byte payload after SELECT means
+there is no status byte and the strip is wrong; 3 bytes means it is right.
+`test_iso_dep_response_without_a_status_byte` pins the current behaviour so the
+fix arrives with a test.
+
 ## Tests
 
-`test_pn7150.py` holds 110 assertions and is written to run **on the board** —
+`test_pn7150.py` holds 132 assertions and is written to run **on the board** —
 copy it to `code.py`. That matters because CPython-only constructs
 (`0xFE in bytearray`, `[::-1]`) pass a desktop syntax check and then fail on
 CircuitPython.
 
 The same file also runs on the desktop. `tests/stubs/` supplies just enough of
 `busio`, `digitalio`, `supervisor` and `micropython` for the pure-logic paths,
-`tests/test_device_suite.py` executes the on-device suite under them, and
-`tests/test_regressions.py` pins the bugs that have been fixed so far. CI runs
-both on every push:
+`tests/test_device_suite.py` executes the on-device suite under them,
+`tests/test_regressions.py` pins the bugs that have been fixed so far, and
+`tests/test_emulation.py` runs the card-emulation half — the applet against
+this driver's own Type 4 reader, and whole taps over a simulated NFCC. CI runs
+all of them on every push:
 
 ```bash
 pip install -e ".[dev]" && pytest
@@ -356,10 +452,11 @@ That leaves the test suite, which is still source. `split_tests.py` packs it
 into parts that each fit, since the whole thing no longer does:
 
 ```bash
-python tools/split_tests.py test_pn7150.py build/    # suite -> 5 runnable parts
+python tools/split_tests.py test_pn7150.py build/    # suite -> 6 runnable parts
 ```
 
-All 110 assertions pass on a Challenger RP2040 NFC that way.
+110 of the 132 assertions have passed on a Challenger RP2040 NFC that way. The
+22 card-emulation ones are new and have so far only been run on the host.
 
 `tools/minify.py` predates the `.mpy` build and is now near-redundant for the
 driver — it is an `ast.unparse` round trip dropping docstrings and comments,
@@ -368,7 +465,7 @@ docstrings too, so minifying first saves only ~310 bytes of the 21 kB `.mpy`.
 It is still worth a run if you are shipping `pn7150.py` as source:
 
 ```bash
-python tools/minify.py pn7150.py build/pn7150.py     # ~38% smaller
+python tools/minify.py pn7150.py build/pn7150.py     # ~40% smaller
 ```
 
 ## Releasing
