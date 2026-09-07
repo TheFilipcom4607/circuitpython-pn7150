@@ -2,3 +2,6 @@ __pycache__/
 *.mpy
 .venv/
 .DS_Store
+*.egg-info/
+build/
+bundles/

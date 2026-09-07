@@ -10,12 +10,31 @@ decodes and writes NDEF; and reports UIDs for all four RF technologies.
 
 ## Install
 
-Copy `pn7150.py` into `CIRCUITPY/lib/`. No other dependencies — it imports only
-core modules (`busio`, `digitalio`, `supervisor`, `micropython`, `time`).
+With [circup](https://github.com/adafruit/circup), which fetches the compiled
+build from this repo's latest release:
 
 ```bash
-cp pn7150.py /Volumes/CIRCUITPY/lib/
+circup bundle-add TheFilipcom4607/circuitpython-pn7150   # one time
+circup install pn7150
 ```
+
+Or by hand — download `circuitpython-pn7150-<major>.x-mpy-<version>.zip` from
+[the latest release](https://github.com/TheFilipcom4607/circuitpython-pn7150/releases/latest),
+matching the zip's major version to the CircuitPython on your board, and copy
+`lib/pn7150.mpy` out of it:
+
+```bash
+cp pn7150.mpy /Volumes/CIRCUITPY/lib/
+```
+
+Copying `pn7150.py` from this repo instead works and is the easiest thing to
+edit in place, but prefer the `.mpy` on a RAM-tight board: the source is 76 kB
+that CircuitPython has to compile into RAM at import, where `pn7150.mpy` is
+21 kB and loads with no compile step at all. On an RP2040 that difference
+decides whether the driver and a large `code.py` fit together.
+
+Either way there are no dependencies — it imports only core modules (`busio`,
+`digitalio`, `supervisor`, `micropython`, `time`).
 
 Examples are in [`examples/`](examples): `nfc_scanner.py` is a scanner with
 NeoPixel feedback, `example_write_tag.py` writes NDEF to an NTAG, and
@@ -330,17 +349,65 @@ types expose no Python-level `__init__`, so only the board caught it.
 
 On a RAM-tight board the driver's source plus a large script may not fit —
 CircuitPython compiles source into RAM at import, and on an RP2040 the two
-together overflow it. Two tools deal with that, and neither changes behaviour:
+together overflow it. Installing the `.mpy` is the real fix for the driver
+half: it is already compiled, so importing it costs no compiler RAM at all.
+
+That leaves the test suite, which is still source. `split_tests.py` packs it
+into parts that each fit, since the whole thing no longer does:
 
 ```bash
-python tools/minify.py pn7150.py build/pn7150.py     # ~38% smaller
 python tools/split_tests.py test_pn7150.py build/    # suite -> 5 runnable parts
 ```
 
-`minify.py` is an `ast.unparse` round trip that drops docstrings and comments;
-the stripped module passes the identical test suite. `split_tests.py` packs the
-on-device suite into parts that each fit, since the whole thing no longer does.
 All 110 assertions pass on a Challenger RP2040 NFC that way.
+
+`tools/minify.py` predates the `.mpy` build and is now near-redundant for the
+driver — it is an `ast.unparse` round trip dropping docstrings and comments,
+and the stripped module passes the identical test suite, but mpy-cross discards
+docstrings too, so minifying first saves only ~310 bytes of the 21 kB `.mpy`.
+It is still worth a run if you are shipping `pn7150.py` as source:
+
+```bash
+python tools/minify.py pn7150.py build/pn7150.py     # ~38% smaller
+```
+
+## Releasing
+
+`.github/workflows/release_gh.yml` builds the bundle zips and attaches them to
+a published GitHub release, using Adafruit's `circuitpython-build-tools`. The
+tag is the only source of truth for the version: `__version__` in `pn7150.py`
+and `version` in `pyproject.toml` both read `0.0.0+auto.0` in a checkout, and
+the build rewrites that literal to the tag.
+
+To cut a release, push a plain semver tag (no `v` prefix — `circup` parses it
+as a version), then publish a GitHub release for that tag. The tag alone does
+nothing; the workflow fires on the release being *published*:
+
+```bash
+git tag 1.3.0 && git push origin 1.3.0
+```
+
+The workflow then attaches six assets:
+
+```
+circuitpython-pn7150-py-1.3.0.zip           source, lib/pn7150.py
+circuitpython-pn7150-9.x-mpy-1.3.0.zip      compiled for CircuitPython 9.x
+circuitpython-pn7150-10.x-mpy-1.3.0.zip     compiled for CircuitPython 10.x
+circuitpython-pn7150-examples-1.3.0.zip     examples/
+circuitpython-pn7150-1.3.0.json             bundle metadata for circup
+z-build_tools_version-1.20.1.ignore         which build-tools cut the release
+```
+
+Those names are what `circup bundle-add TheFilipcom4607/circuitpython-pn7150`
+expects, and they are derived from the repository name — renaming the repo
+breaks `circup` until the next release.
+
+Two things to know. GitHub runs release-triggered workflows from the copy of
+the file on the default branch, so the workflow must be on `main` before a
+release will build anything. And the 9.x and 10.x builds are currently
+byte-identical, since both toolchains emit mpy v6.3; they are shipped
+separately because that is what `circup` looks for, and because that will not
+stay true forever.
 
 ## License and credits
 

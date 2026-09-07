@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "circuitpython-pn7150"
-version = "1.2.0"
+version = "0.0.0+auto.0"
 description = "A friendlier CircuitPython driver for the NXP PN7150 NFC controller, with NDEF decoding and encoding built in"
 readme = "README.md"
 license = { file = "LICENSE" }

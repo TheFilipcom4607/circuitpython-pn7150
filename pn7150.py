@@ -30,7 +30,9 @@ from supervisor import ticks_ms
 from digitalio import DigitalInOut, Pull
 import busio
 
-__version__ = "1.2.0"
+# Stamped from the git tag at release time by circuitpython-build-tools; a
+# checkout always reads 0.0.0+auto.0.
+__version__ = "0.0.0+auto.0"
 
 _TICKS_PERIOD = const(1 << 29)
 
