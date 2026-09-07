@@ -16,6 +16,13 @@ on:
   release:
     types: [published]
 
+# The upload step needs write access to releases. Adafruit's own copy of this
+# workflow omits this because their org defaults workflow tokens to write; on a
+# repo left at GitHub's read-only default the upload fails with
+# "Resource not accessible by integration".
+permissions:
+  contents: write
+
 jobs:
   upload-release-assets:
     runs-on: ubuntu-latest
