@@ -402,9 +402,16 @@ Those names are what `circup bundle-add TheFilipcom4607/circuitpython-pn7150`
 expects, and they are derived from the repository name — renaming the repo
 breaks `circup` until the next release.
 
+`requirements.txt` must exist at the repo root even though the driver has no
+dependencies — Adafruit's `actions-ci/install.sh` runs `pip install -r
+requirements.txt` with no existence check, and the build dies at that step
+without it.
+
 Two things to know. GitHub runs release-triggered workflows from the copy of
 the file on the default branch, so the workflow must be on `main` before a
-release will build anything. And the 9.x and 10.x builds are currently
+release will build anything. A release build checks out the *tag*, not `main`,
+so a fix to the build has to be in a new tag — re-running a failed release
+job against an old tag rebuilds the old tree. And the 9.x and 10.x builds are currently
 byte-identical, since both toolchains emit mpy v6.3; they are shipped
 separately because that is what `circup` looks for, and because that will not
 stay true forever.
