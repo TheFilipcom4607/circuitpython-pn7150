@@ -315,6 +315,7 @@ Other things worth knowing, all learned the hard way:
 | A phone never notices the emulated tag | `LA_SEL_INFO` did not take, so the SAK does not advertise ISO-DEP and the phone never sends RATS. `debug=True`: the bring-up must contain `20 02 04 01 32 01 20`. |
 | The emulated tag works for one tap, then nothing | Something sent `RF_DEACTIVATE(Sleep)` in a listen state, which the PN7150 refuses (UM10936 §9.1). Recovery is idle then `RF_DISCOVER`; `CardEmulator` does that itself. |
 | A phone sees the tag but reads nothing | The applet answered `6A82`/`6986`. `Type4NDEFApplet.process()` runs on the desktop — replay the C-APDUs from `debug=True` against it. |
+| With `also_poll=True`, phones stop being noticed | A tag is sitting in the field. Polling wins every round while it is there, so listen mode never gets a turn and the phone sees a permanent reader field — an iPhone offers Apple Pay instead of showing a banner. Move the tag away; vicinity (ISO15693) cards reach much further than you would expect. |
 
 ## Known limitations
 
@@ -338,6 +339,11 @@ Other things worth knowing, all learned the hard way:
   `LB_H_INFO_RESP` as unsupported anyway.
 * **An emulated tag is not persistent.** It exists while `emulate_ndef()` or
   `CardEmulator.run()` is running; there is no offline card mode.
+* **`also_poll=True` gives the reader priority.** A tag left in the field is
+  re-read every round and card emulation never gets a turn, so a phone tapped
+  at the same time is ignored. Measured: one ISO15693 card in range produced
+  318 consecutive reads and not one served APDU. Nothing in the console says
+  this is what is happening.
 * **`wait_for_tag()` busy-waits on the IRQ pin**, so it does not cooperate with
   `asyncio`. Poll with a short `timeout=` if you need to share the CPU.
 
@@ -377,6 +383,19 @@ single corrupted frame destroying a 303-byte message, `has_ndef_service()` and
 `select_ndef_application()` raising instead of answering, and the controller's
 own error notifications being ignored.
 
+Card emulation was then taken to a phone, on CircuitPython 10.3.0 with the
+`.mpy` installed — an iPhone reading, a Flipper Zero standing in for an NTAG,
+and a DESFire hotel key for the ISO-DEP probe:
+
+| Path | Result |
+|---|---|
+| `emulate_ndef()`, first tap | the iPhone showed the `https://thefilip.com` banner, and all 7 APDUs were answered; nothing returned `6A82` or `6986` |
+| A second tap, no power cycle | the full exchange again — the deactivate-to-idle-then-`RF_DISCOVER` recovery holds |
+| `also_poll=True` | `24 APDUs served, 89 tags read` in one loop, phone and tag alternating, no errors |
+| `writable=True`, read half | `on_read` fired; the CC advertises write access `00`, as against `FF` when read-only |
+| `writable=True`, write half | **unverified** — see below |
+| The on-device suite | `35/16/28/18/13/22 passed, 0 failed` — all 132, including the 22 emulation assertions |
+
 ### Not proven on hardware
 
 Implemented and guarded, but no suitable tag was available. Treat these as the
@@ -384,27 +403,28 @@ parts most likely to still have a bug:
 
 | Path | Why untested |
 |---|---|
-| Card emulation, all of it | written against the manual, not yet taken to a phone |
+| A phone *writing* to the emulated tag | iOS's NFC Tools never gets as far as `UPDATE BINARY`; needs an Android device |
 | `Type4Tag.write_ndef()`, `update_binary()` | no writable Type 4 tag |
 | `Type5Tag.write_block()`, `write_ndef()` | no writable ISO15693 tag |
 | 8-byte Type 5 capability container | no tag over 2040 bytes; unit-tested only |
 | Mifare Classic 4K geometry | no 4K card; the sector maths is unit-tested |
 | `Type3Tag.read_ndef()` | no FeliCa carrying NDEF; synthetic card only |
 
-Card emulation has never met a phone. What it *has* met, in
+Card emulation has now met a phone; the results are in the table above. What
+it was checked against first, in
 [`tests/test_emulation.py`](tests/test_emulation.py), is a fake NFCC on the I2C
 stub: `connect()`, the listen bring-up, activation, a whole tap's worth of
 APDUs with the responses segmented and credit-gated, deactivation, and a second
 tap afterwards — all through the driver's real transport. The reader half of
-this driver plays the phone, so the C-APDUs are not invented. The list to work
-through on hardware is: a phone showing the URL, a second phone without a power
-cycle, `writable=True` from Android's NFC Tools, and `also_poll=True` reading
-an NTAG and answering a phone in one loop.
+this driver plays the phone, so the C-APDUs are not invented. That simulation
+predicted the real trace closely: a real iPhone differs only in reading `NLEN`
+twice and in sometimes probing with a short tap before committing to a full
+read. The one item left on the hardware list is a phone *writing* to the tag.
 
-### A suspected bug in the Type 4 *reader*
+### A confirmed bug in the Type 4 *reader*
 
-Found while reading the two sides against each other, not yet confirmed on
-hardware, so nothing has been changed. [`Type4Tag.apdu()`](pn7150.py) runs its
+Found while reading the two sides against each other, and since measured on
+hardware. Nothing has been changed yet. [`Type4Tag.apdu()`](pn7150.py) runs its
 response through `_split_status()`, which strips a trailing NCI status byte.
 That byte is real for the Frame and TAG-CMD interfaces — the measured table
 above covers Type 2, MIFARE and ISO15693, all of which use those — but NCI puts
@@ -414,10 +434,22 @@ With the extra strip, a card answering `90 00` is one byte short of an APDU and
 `select_ndef_application()` returns `False` — which is exactly the hardware
 result recorded above: *"ISO-DEP ×6 | no NDEF application"*.
 
-Confirm it in one tap with `debug=True`: a 2-byte payload after SELECT means
-there is no status byte and the strip is wrong; 3 bytes means it is right.
-`test_iso_dep_response_without_a_status_byte` pins the current behaviour so the
-fix arrives with a test.
+A DESFire hotel key settled it. An APDU with a deliberately invalid class byte,
+sent over the ISO-DEP interface, came back as a **2-byte** payload:
+
+```
+activated: Type 4 (ISO-DEP/DESFire)  NFC-A  UID 4f:36:49:cf
+raw NCI data payload: 2 bytes: 6d:00
+select_ndef_application(): False
+```
+
+Two bytes is the status word with nothing after it, so ISO-DEP appends no status
+byte and the strip eats SW2. (The card answered `6D00`, *instruction* not
+supported, rather than the `6E00` the probe assumed; either way a status word.)
+
+The fix is not in this pass: it is a reader bug, it touches nothing in card
+emulation, and `test_iso_dep_response_without_a_status_byte` currently pins the
+wrong behaviour, so that test has to change with it.
 
 ## Tests
 
@@ -448,6 +480,25 @@ CircuitPython compiles source into RAM at import, and on an RP2040 the two
 together overflow it. Installing the `.mpy` is the real fix for the driver
 half: it is already compiled, so importing it costs no compiler RAM at all.
 
+Build that `.mpy` with **CircuitPython's** `mpy-cross`, not the `mpy-cross` on
+PyPI — that one is MicroPython's, and the two formats diverged: CircuitPython
+writes magic `43` (`C`) where MicroPython writes `4D` (`M`), and the board
+rejects the wrong one at import with `ValueError: MicroPython .mpy file; use
+CircuitPython mpy-cross`. It is a one-byte difference in an otherwise identical
+file, so it is easy to ship by accident. Adafruit publishes no prebuilt
+mpy-cross for CircuitPython 10.x on macOS; build it from the tag matching the
+firmware on the board:
+
+```bash
+git clone --depth 1 --branch 10.3.0 https://github.com/adafruit/circuitpython
+pip install huffman                       # a build dependency of mpy-cross
+make -C circuitpython/mpy-cross
+circuitpython/mpy-cross/build/mpy-cross -o pn7150.mpy -s pn7150.py pn7150.py
+```
+
+The release workflow does this correctly on its own; this only matters when
+building by hand between releases.
+
 That leaves the test suite, which is still source. `split_tests.py` packs it
 into parts that each fit, since the whole thing no longer does:
 
@@ -455,8 +506,22 @@ into parts that each fit, since the whole thing no longer does:
 python tools/split_tests.py test_pn7150.py build/    # suite -> 6 runnable parts
 ```
 
-110 of the 132 assertions have passed on a Challenger RP2040 NFC that way. The
-22 card-emulation ones are new and have so far only been run on the host.
+`tools/run_on_board.py` then drives those parts from the host: it copies a
+script to `code.py`, reloads the board and captures the console, so the output
+lands in your terminal rather than in a serial monitor you have to watch.
+
+```bash
+pip install pyserial
+python tools/run_on_board.py --list                  # drive, port, lib/ contents
+for f in build/*.py; do python tools/run_on_board.py "$f" --timeout 90; done
+```
+
+It exits non-zero if the sentinel never arrives or if `FAIL`/`Traceback`
+appears, so it can be run unattended.
+
+All 132 assertions pass on a Challenger RP2040 NFC that way, the six parts
+reporting `35`, `16`, `28`, `18`, `13` and `22` passed with none failed — the
+last of those being the card-emulation set.
 
 `tools/minify.py` predates the `.mpy` build and is now near-redundant for the
 driver — it is an `ast.unparse` round trip dropping docstrings and comments,
