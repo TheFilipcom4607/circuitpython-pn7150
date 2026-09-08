@@ -1,5 +1,9 @@
 # circuitpython-pn7150
 
+[![tests](https://github.com/TheFilipcom4607/circuitpython-pn7150/actions/workflows/ci.yml/badge.svg)](https://github.com/TheFilipcom4607/circuitpython-pn7150/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/TheFilipcom4607/circuitpython-pn7150?sort=semver)](https://github.com/TheFilipcom4607/circuitpython-pn7150/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A single-file CircuitPython driver for the NXP **PN7150** NFC controller, with
 NDEF decoding and encoding built in. Written for the
 [iLabs Challenger RP2040 NFC](https://ilabs.se/product/challenger-rp2040-nfc/)
@@ -9,6 +13,33 @@ Reads NTAG/Ultralight, Mifare Classic, DESFire/ISO-DEP, ISO15693 and FeliCa;
 decodes and writes NDEF; and reports UIDs for all four RF technologies. It also
 goes the other way — `nfc.emulate_ndef("https://…")` makes the board itself
 look like a Type 4 tag, so tapping a phone on it opens a URL.
+
+```python
+import board
+from pn7150 import PN7150
+
+nfc = PN7150(board.NFC_SCL, board.NFC_SDA, board.NFC_IRQ, board.NFC_RESET)
+with nfc:
+    for tag in nfc.scan():
+        print(tag.type, tag.uid_hex)
+        if tag.ndef:
+            print("  ->", tag.ndef.value)
+```
+
+```
+Type 2 (NTAG/Ultralight) 04:8c:e8:12:34:56:80
+  -> https://thefilip.com
+```
+
+**Contents:** [Install](#install) · [Examples](#examples) ·
+[Wiring](#wiring) ·
+[Why not ElectronicCats](#why-not-electroniccats_circuitpython_pn7150) ·
+[API](#api) · [NDEF](#ndef) · [Card emulation](#card-emulation) ·
+[Hardware notes](#hardware-notes) · [Troubleshooting](#troubleshooting) ·
+[Known limitations](#known-limitations) ·
+[Verified on hardware](#verified-on-hardware) ·
+[Tests and tooling](#tests-and-tooling) ·
+[Releasing](#releasing) · [License and credits](#license-and-credits)
 
 ## Install
 
@@ -36,12 +67,20 @@ that CircuitPython has to compile into RAM at import, where `pn7150.mpy` is
 decides whether the driver and a large `code.py` fit together.
 
 Either way there are no dependencies — it imports only core modules (`busio`,
-`digitalio`, `supervisor`, `micropython`, `time`).
+`digitalio`, `supervisor`, `micropython`, `time`). Compiled builds are published
+for CircuitPython 9.x and 10.x; the source runs on either.
 
-Examples are in [`examples/`](examples): `nfc_scanner.py` is a scanner with
-NeoPixel feedback, `example_write_tag.py` writes NDEF to an NTAG, and
-`badge_reader.py` matches a UID and waits for the badge to be lifted. Copy any
-of them to `CIRCUITPY/code.py`.
+### Examples
+
+Copy any of these to `CIRCUITPY/code.py`:
+
+| Example | What it does |
+|---|---|
+| [`nfc_scanner.py`](examples/nfc_scanner.py) | scans, prints and decodes every tag, with NeoPixel feedback |
+| [`example_write_tag.py`](examples/example_write_tag.py) | writes an NDEF message to an NTAG |
+| [`badge_reader.py`](examples/badge_reader.py) | matches a UID, then waits for the badge to be lifted |
+| [`emulate_ndef.py`](examples/emulate_ndef.py) | *is* a Type 4 tag — tap a phone, a URL comes up |
+| [`reader_and_card.py`](examples/reader_and_card.py) | reads tags and answers phones in one loop |
 
 ### Wiring
 
@@ -451,7 +490,7 @@ The fix is not in this pass: it is a reader bug, it touches nothing in card
 emulation, and `test_iso_dep_response_without_a_status_byte` currently pins the
 wrong behaviour, so that test has to change with it.
 
-## Tests
+## Tests and tooling
 
 `test_pn7150.py` holds 132 assertions and is written to run **on the board** —
 copy it to `code.py`. That matters because CPython-only constructs
@@ -474,6 +513,8 @@ A green desktop run is necessary, not sufficient — the on-device run is still
 the one that counts. `CommandError.__init__` calling `PN7150Error.__init__`
 shipped once and passed every desktop test: CircuitPython's native exception
 types expose no Python-level `__init__`, so only the board caught it.
+
+### Building the `.mpy`
 
 On a RAM-tight board the driver's source plus a large script may not fit —
 CircuitPython compiles source into RAM at import, and on an RP2040 the two
@@ -498,6 +539,8 @@ circuitpython/mpy-cross/build/mpy-cross -o pn7150.mpy -s pn7150.py pn7150.py
 
 The release workflow does this correctly on its own; this only matters when
 building by hand between releases.
+
+### Running the suite on the board
 
 That leaves the test suite, which is still source. `split_tests.py` packs it
 into parts that each fit, since the whole thing no longer does:
