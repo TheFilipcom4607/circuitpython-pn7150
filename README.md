@@ -10,9 +10,11 @@ NDEF decoding and encoding built in. Written for the
 but not tied to it — any board with I2C plus two GPIOs will do.
 
 Reads NTAG/Ultralight, Mifare Classic, DESFire/ISO-DEP, ISO15693 and FeliCa;
-decodes and writes NDEF; and reports UIDs for all four RF technologies. It also
-goes the other way — `nfc.emulate_ndef("https://…")` makes the board itself
-look like a Type 4 tag, so tapping a phone on it opens a URL.
+decodes and writes NDEF; and reports UIDs for all four RF technologies. NDEF
+here is more than URLs: Wi-Fi credentials, contacts, phone numbers, Bluetooth
+pairing and HomeKit setup are built and parsed too, in the encodings phones
+act on. It also goes the other way — `nfc.emulate_ndef("https://…")` makes the
+board itself look like a Type 4 tag, so tapping a phone on it opens a URL.
 
 ```python
 import board
@@ -34,7 +36,9 @@ Type 2 (NTAG/Ultralight) 04:8c:e8:12:34:56:80
 **Contents:** [Install](#install) · [Examples](#examples) ·
 [Wiring](#wiring) ·
 [Why not ElectronicCats](#why-not-electroniccats_circuitpython_pn7150) ·
-[API](#api) · [NDEF](#ndef) · [Card emulation](#card-emulation) ·
+[API](#api) · [NDEF](#ndef) ·
+[Wi-Fi, contacts and the rest](#wi-fi-contacts-and-the-rest) ·
+[Card emulation](#card-emulation) ·
 [Hardware notes](#hardware-notes) · [Troubleshooting](#troubleshooting) ·
 [Known limitations](#known-limitations) ·
 [Verified on hardware](#verified-on-hardware) ·
@@ -61,9 +65,9 @@ cp pn7150.mpy /Volumes/CIRCUITPY/lib/
 ```
 
 Copying `pn7150.py` from this repo instead works and is the easiest thing to
-edit in place, but prefer the `.mpy` on a RAM-tight board: the source is 76 kB
+edit in place, but prefer the `.mpy` on a RAM-tight board: the source is 141 kB
 that CircuitPython has to compile into RAM at import, where `pn7150.mpy` is
-21 kB and loads with no compile step at all. On an RP2040 that difference
+38 kB and loads with no compile step at all. On an RP2040 that difference
 decides whether the driver and a large `code.py` fit together.
 
 Either way there are no dependencies — it imports only core modules (`busio`,
@@ -78,6 +82,7 @@ Copy any of these to `CIRCUITPY/code.py`:
 |---|---|
 | [`nfc_scanner.py`](examples/nfc_scanner.py) | scans, prints and decodes every tag, with NeoPixel feedback |
 | [`example_write_tag.py`](examples/example_write_tag.py) | writes an NDEF message to an NTAG |
+| [`write_wifi_tag.py`](examples/write_wifi_tag.py) | writes a tag that joins a Wi-Fi network on tap |
 | [`badge_reader.py`](examples/badge_reader.py) | matches a UID, then waits for the badge to be lifted |
 | [`emulate_ndef.py`](examples/emulate_ndef.py) | *is* a Type 4 tag — tap a phone, a URL comes up |
 | [`reader_and_card.py`](examples/reader_and_card.py) | reads tags and answers phones in one loop |
@@ -113,6 +118,7 @@ stops at "a tag was seen":
 | UID for NFC-B / F / V | `None` | yes |
 | Tag type as text | raw ints | `tag.type` |
 | NDEF decoding | none | URI, text, MIME, external; multi-record |
+| Wi-Fi / contact / Bluetooth / HomeKit records | none | built and parsed |
 | NDEF encoding / writing | none | `tag.write_ndef(...)` |
 | Type 2 read/write | raw `tag_cmd` only | `read`/`write`/`read_memory` |
 | Type 4 (DESFire) | none | APDUs + full NDEF flow |
@@ -198,8 +204,11 @@ msg = NDEFMessage([NDEFRecord.mime("application/cbor", data),
 
 msg.uri, msg.text, msg.value      # first matching record
 for rec in msg:
-    rec.kind      # "uri" | "text" | "mime" | "external" | "unknown"
-    rec.value     # str for uri/text, bytes otherwise
+    rec.kind      # "uri" | "text" | "wifi" | "contact" | "bluetooth"
+                  # | "bluetooth_le" | "handover" | "mime" | "external"
+                  # | "unknown"
+    rec.value     # str for uri/text, dict for wifi/contact/bluetooth,
+                  # bytes otherwise
     rec.language  # text records only
 ```
 
@@ -208,6 +217,98 @@ directly: `NDEFMessage.from_bytes(msg.to_bytes()) == msg`.
 
 All 36 URI prefix codes are handled, so `tel:+48…` and `https://…` both
 round-trip to their short form on the tag.
+
+### Wi-Fi, contacts and the rest
+
+A phone acts on the record *type*, not on the text inside it. A `text/vcard`
+record offers to add a contact, `application/vnd.wfa.wsc` offers to join a
+network, a `tel:` URI opens the dialler, an `X-HM://` URI starts HomeKit
+pairing. Each of those is one call, and each goes on a tag or out of the
+emulator exactly like a URL does:
+
+```python
+tag.write_ndef(NDEFMessage.from_wifi("HomeNet", "correcthorsebatterystaple"))
+nfc.emulate_ndef(NDEFMessage.from_contact("Ada Lovelace",
+                                          phone="+48123456789",
+                                          email="ada@example.com"))
+```
+
+| Built with | Record on the tag | Tapping a phone offers |
+|---|---|---|
+| `from_wifi(ssid, password)` | `application/vnd.wfa.wsc` | join the network |
+| `from_contact(name, phone=…, email=…)` | `text/vcard` | add the contact |
+| `from_tel(number)` | `tel:` URI | dial it |
+| `from_sms(number, message)` | `sms:` URI | send the message |
+| `from_email(address, subject, body)` | `mailto:` URI | write the mail |
+| `from_bluetooth(address, name)` | `…bluetooth.ep.oob` | pair the device |
+| `from_bluetooth_le(address, name=…)` | `…bluetooth.le.oob` | nothing, on the phones tried |
+| `from_homekit(code, category=…, setup_id=…)` | `X-HM://` URI | carry an accessory's setup code |
+
+What a phone does with a record is the platform's decision, not this driver's,
+and it varies — see
+[what a phone does with a credential record](#what-a-phone-does-with-a-credential-record)
+for a Pixel 10 and an iPhone 16 Pro, record by record. Two to know up front:
+**Wi-Fi and contact records are an Android feature**, ignored by iOS, and
+**HomeKit does not make the board an accessory** — `from_homekit()` carries
+the setup code printed under an accessory's QR code, and iOS pairs with a
+device that answers back, which a tag is not.
+
+Every one of them parses back, so a tag written by a phone reads here too.
+The decoded values are plain dicts, with `None` for anything the tag left out:
+
+```python
+tag.ndef.wifi       # {"ssid": "HomeNet", "password": "…", "security": "wpa2",
+                    #  "authentication": 32, "encryption": 8, "mac": None}
+tag.ndef.contact    # {"name": "Ada Lovelace", "phone": [...], "email": [...],
+                    #  "organization": …, "title": …, "url": …, "address": …,
+                    #  "note": …, "text": "BEGIN:VCARD…"}
+tag.ndef.bluetooth  # {"address": "a4:c1:38:01:02:03", "name": "Speaker",
+                    #  "class_of_device": 0x240404, "low_energy": False,
+                    #  "address_type": None, "role": None}
+tag.ndef.homekit    # {"setup_code": "518-08-361", "category": 5, "flags": 2,
+                    #  "setup_id": "7OSX", "version": 0, "uri": "X-HM://…"}
+tag.ndef.email      # {"address": "ada@example.com", "subject": "Hello",
+                    #  "body": "Sent by a tag"}
+tag.ndef.phone      # "+48123456789"
+```
+
+`message.first(kind)` is the general form; `.uri`, `.text`, `.wifi`,
+`.contact`, `.bluetooth`, `.bluetooth_le`, `.phone`, `.email` and `.homekit`
+are shortcuts for the common ones.
+
+Decoding never raises on a malformed payload — a truncated credential comes
+back as a dict of `None`s, so a scanner loop cannot be killed by a bad tag.
+Building one does raise `NDEFError` on input no reader would accept: a WPA
+passphrase under 8 characters, a secured network with no password, an open one
+*with* a password, an SSID over 32 bytes, an address that is not six hex
+bytes, a contact with no name, a HomeKit code that is not 8 digits.
+
+Wi-Fi defaults to WPA2 Personal with AES when a password is given and to an
+open network when it is not; pass `authentication=` and `encryption=` (the
+`WIFI_*` and `WIFI_ENC_*` constants) for anything else, and `mac=` to pin the
+credential to one access point. HomeKit takes the setup code with or without
+dashes, or a whole `X-HM://` URI to pass through, plus the `HOMEKIT_*`
+category constants.
+
+The names here match
+[circuitpython-st25dv](https://github.com/TheFilipcom4607/circuitpython-st25dv)
+deliberately, constants, decoded keys and all, so record code moves between
+the two drivers unchanged.
+
+Bluetooth records go on the tag bare, which is what a Pixel 10 paired from.
+Readers that want the NFC Forum framing instead take a handover message:
+
+```python
+speaker = NDEFRecord.bluetooth("AA:BB:CC:DD:EE:FF", "Speaker")
+tag.write_ndef(NDEFMessage.handover_select([speaker]))
+```
+
+That builds the `Hs` record listing each carrier by record id, followed by the
+carrier records themselves. `msg.bluetooth` finds the device either way.
+
+All of it together adds about 9 kB to the compiled `.mpy`, in two sections of
+`pn7150.py` under the `Wi-Fi, contacts, radios` banners plus the constructors
+on `NDEFRecord` and `NDEFMessage`.
 
 ### Card emulation
 
@@ -448,6 +549,38 @@ parts most likely to still have a bug:
 | 8-byte Type 5 capability container | no tag over 2040 bytes; unit-tested only |
 | Mifare Classic 4K geometry | no 4K card; the sector maths is unit-tested |
 | `Type3Tag.read_ndef()` | no FeliCa carrying NDEF; synthetic card only |
+| Wi-Fi, contact, Bluetooth and HomeKit records | no phone has been tapped on one *from this driver* — but see below, where the bytes have been |
+
+### What a phone does with a credential record
+
+The record builders emit bytes identical to
+[circuitpython-st25dv](https://github.com/TheFilipcom4607/circuitpython-st25dv),
+a sibling driver by the same author, whose records were tapped against a
+Pixel 10 and an iPhone 16 Pro. `tests/test_records.py` pins that equality
+against literals taken from it, so the run below stops carrying over the
+moment a payload here drifts. What has *not* been checked from this driver is
+the RF path: these records reaching a phone through the PN7150, whether off a
+tag it wrote or out of `emulate_ndef()`.
+
+| Record | Pixel 10 | iPhone 16 Pro |
+|---|---|---|
+| URL | opens it | opens it |
+| `tel:` | dialler, prefilled | inconclusive |
+| `sms:` | composer, body and punctuation intact | inconclusive |
+| `mailto:` | composer, subject and body intact | inconclusive |
+| Contact vCard | saves it, every field | ignored; Apple does not take vCard from a tag |
+| Wi-Fi | offers to join, names the network | ignored; Wi-Fi over NFC is Android only |
+| Bluetooth | offers to pair, names the device | inconclusive |
+| Bluetooth LE | nothing, though the bytes are well formed | inconclusive |
+| HomeKit `X-HM://` | not applicable | untested |
+
+Bluetooth LE is a real negative rather than an artefact: fresh content, on a
+phone that had just handled classic Bluetooth correctly.
+
+**Both phones deduplicate.** Re-presenting content a phone has already read is
+the fastest way to get a false negative — on the iPhone it eventually
+suppressed even a plain URL, which is why several rows read inconclusive
+rather than failed. Use unique content for every single tap.
 
 Card emulation has now met a phone; the results are in the table above. What
 it was checked against first, in
@@ -492,7 +625,7 @@ wrong behaviour, so that test has to change with it.
 
 ## Tests and tooling
 
-`test_pn7150.py` holds 132 assertions and is written to run **on the board** —
+`test_pn7150.py` holds 173 assertions and is written to run **on the board** —
 copy it to `code.py`. That matters because CPython-only constructs
 (`0xFE in bytearray`, `[::-1]`) pass a desktop syntax check and then fail on
 CircuitPython.
@@ -500,10 +633,12 @@ CircuitPython.
 The same file also runs on the desktop. `tests/stubs/` supplies just enough of
 `busio`, `digitalio`, `supervisor` and `micropython` for the pure-logic paths,
 `tests/test_device_suite.py` executes the on-device suite under them,
-`tests/test_regressions.py` pins the bugs that have been fixed so far, and
-`tests/test_emulation.py` runs the card-emulation half — the applet against
-this driver's own Type 4 reader, and whole taps over a simulated NFCC. CI runs
-all of them on every push:
+`tests/test_regressions.py` pins the bugs that have been fixed so far,
+`tests/test_records.py` pins the Wi-Fi, contact, Bluetooth and HomeKit byte
+layouts against the encodings phones expect and against the sibling driver
+that was tapped on a phone, and `tests/test_emulation.py` runs
+the card-emulation half — the applet against this driver's own Type 4 reader,
+and whole taps over a simulated NFCC. CI runs all of them on every push:
 
 ```bash
 pip install -e ".[dev]" && pytest
@@ -546,7 +681,7 @@ That leaves the test suite, which is still source. `split_tests.py` packs it
 into parts that each fit, since the whole thing no longer does:
 
 ```bash
-python tools/split_tests.py test_pn7150.py build/    # suite -> 6 runnable parts
+python tools/split_tests.py test_pn7150.py build/    # suite -> 7 runnable parts
 ```
 
 `tools/run_on_board.py` then drives those parts from the host: it copies a
@@ -562,14 +697,16 @@ for f in build/*.py; do python tools/run_on_board.py "$f" --timeout 90; done
 It exits non-zero if the sentinel never arrives or if `FAIL`/`Traceback`
 appears, so it can be run unattended.
 
-All 132 assertions pass on a Challenger RP2040 NFC that way, the six parts
-reporting `35`, `16`, `28`, `18`, `13` and `22` passed with none failed — the
-last of those being the card-emulation set.
+The 132 assertions that existed then pass on a Challenger RP2040 NFC that way,
+the six parts of that run reporting `35`, `16`, `28`, `18`, `13` and `22`
+passed with none failed — the last of those being the card-emulation set. The
+41 Wi-Fi, contact, Bluetooth, HomeKit and mailto assertions added since are
+their own part and have not been through a board run yet.
 
 `tools/minify.py` predates the `.mpy` build and is now near-redundant for the
 driver — it is an `ast.unparse` round trip dropping docstrings and comments,
 and the stripped module passes the identical test suite, but mpy-cross discards
-docstrings too, so minifying first saves only ~310 bytes of the 21 kB `.mpy`.
+docstrings too, so minifying first saves only ~310 bytes of the 38 kB `.mpy`.
 It is still worth a run if you are shipping `pn7150.py` as source:
 
 ```bash

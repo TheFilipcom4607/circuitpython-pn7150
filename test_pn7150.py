@@ -295,6 +295,97 @@ check("transient status is retried", pn7150._is_transient(
 check("refusal is not retried", pn7150._is_transient(
     pn7150.CommandError("x", 0x03)), False)
 
+print("--- Wi-Fi, contacts, Bluetooth, HomeKit ---")
+_wifi = NDEFMessage.from_wifi("HomeNet", "correcthorse")
+check("wifi mime type", _wifi.records[0].type, b"application/vnd.wfa.wsc")
+check("wifi kind", _wifi.records[0].kind, "wifi")
+_wifi_back = NDEFMessage.from_bytes(_wifi.to_bytes()).wifi
+check("wifi ssid", _wifi_back["ssid"], "HomeNet")
+check("wifi password", _wifi_back["password"], "correcthorse")
+check("wifi defaults to wpa2", _wifi_back["authentication"], pn7150.WIFI_WPA2_PSK)
+check("no mac attribute unless asked for", _wifi_back["mac"], None)
+check_raises("wifi refuses an open network with a password",
+             lambda: NDEFRecord.wifi("HomeNet", "correcthorse",
+                                     authentication=pn7150.WIFI_OPEN),
+             pn7150.NDEFError)
+check("wifi security name", _wifi_back["security"], "wpa2")
+check("open network has no key",
+      NDEFMessage.from_wifi("Guest").wifi["password"], "")
+check_raises("wifi refuses a short passphrase",
+             lambda: NDEFRecord.wifi("HomeNet", "short"), pn7150.NDEFError)
+
+_card = NDEFMessage.from_contact("Ada Lovelace", phone="+48123456789",
+                                 email="ada@example.com", note="one;two")
+check("contact kind", _card.records[0].kind, "contact")
+_card_back = NDEFMessage.from_bytes(_card.to_bytes()).contact
+check("contact name", _card_back["name"], "Ada Lovelace")
+check("contact phones", _card_back["phone"], ["+48123456789"])
+check("contact emails", _card_back["email"], ["ada@example.com"])
+check("contact unescapes", _card_back["note"], "one;two")
+
+_bt = NDEFMessage.from_bluetooth("AA:BB:CC:DD:EE:FF", "Speaker",
+                                 class_of_device=0x240404)
+check("bluetooth address is little endian on the wire",
+      _bt.records[0].payload[2:8], b"\xff\xee\xdd\xcc\xbb\xaa")
+_bt_back = NDEFMessage.from_bytes(_bt.to_bytes()).bluetooth
+check("bluetooth address", _bt_back["address"], "aa:bb:cc:dd:ee:ff")
+check("bluetooth name", _bt_back["name"], "Speaker")
+check("bluetooth class of device", _bt_back["class_of_device"], 0x240404)
+_ble = NDEFRecord.bluetooth_le("AA:BB:CC:DD:EE:FF", address_type=1,
+                               name="Tag")
+check("ble kind", _ble.kind, "bluetooth_le")
+check("ble address type", _ble.value["address_type"], "random")
+check("ble role", _ble.value["role"], "peripheral")
+_hs = NDEFMessage.handover_select(
+    [NDEFRecord.bluetooth("AA:BB:CC:DD:EE:FF", "Speaker")])
+check("handover select record", _hs.records[0].type, b"Hs")
+check("handover carrier is still found",
+      NDEFMessage.from_bytes(_hs.to_bytes()).bluetooth["name"], "Speaker")
+
+_hk = NDEFRecord.homekit("518-08-361", category=pn7150.HOMEKIT_LIGHTBULB,
+                         setup_id="7OSX")
+check("homekit uri", _hk.value, "X-HM://0052VG2ND7OSX")
+_hk_back = NDEFMessage.from_bytes(NDEFMessage([_hk]).to_bytes()).homekit
+check("homekit setup code", _hk_back["setup_code"], "518-08-361")
+check("homekit category", _hk_back["category"], pn7150.HOMEKIT_LIGHTBULB)
+check("homekit setup id", _hk_back["setup_id"], "7OSX")
+check_raises("homekit refuses a short code",
+             lambda: NDEFRecord.homekit("12345"), pn7150.NDEFError)
+
+# Byte-identical to circuitpython-st25dv, which was tapped against a Pixel 10
+# and an iPhone 16 Pro; that run only carries over while these hold.
+check("wifi bytes match the tested driver",
+      NDEFRecord.wifi("Guest Wi-Fi", "correct horse").payload,
+      b"\x10\x0e\x001\x10&\x00\x01\x01\x10E\x00\x0bGuest Wi-Fi"
+      b"\x10\x03\x00\x02\x00 \x10\x0f\x00\x02\x00\x08"
+      b"\x10'\x00\rcorrect horse")
+check("bluetooth bytes match the tested driver",
+      NDEFRecord.bluetooth("a4:c1:38:01:02:03", "Speaker",
+                           class_of_device=0x240404).payload,
+      b"\x16\x00\x03\x02\x018\xc1\xa4\x08\tSpeaker\x04\r\x04\x04$")
+
+_tel = NDEFMessage.from_tel("+48123456789")
+check("tel uses prefix code 5", _tel.records[0].payload[0], 5)
+check("phone number", NDEFMessage.from_bytes(_tel.to_bytes()).phone,
+      "+48123456789")
+check("sms body is percent encoded", NDEFRecord.sms("+1555", "a b").value,
+      "sms:+1555?body=a%20b")
+check("first(kind) finds a record",
+      NDEFMessage([NDEFRecord.text("x"), _hk]).first("uri"),
+      "X-HM://0052VG2ND7OSX")
+check("mailto with a subject", NDEFRecord.email("a@b.co", "Hej").value,
+      "mailto:a@b.co?subject=Hej")
+_mail = NDEFMessage.from_email("ada@example.com", "Hej", "one & two")
+_mail_back = NDEFMessage.from_bytes(_mail.to_bytes()).email
+check("email address", _mail_back["address"], "ada@example.com")
+check("email subject", _mail_back["subject"], "Hej")
+check("email body is percent-decoded", _mail_back["body"], "one & two")
+check("a plus in an address is not a space",
+      NDEFMessage.from_email("ada+tags@e.co").email["address"],
+      "ada+tags@e.co")
+check("no mailto record, no email",
+      NDEFMessage.from_uri("https://a.co").email, None)
+
 print("--- new API ---")
 _ext = NDEFRecord.external("example.com:widget", b"\x01\x02")
 _back = NDEFMessage.from_bytes(NDEFMessage([_ext]).to_bytes())
