@@ -760,8 +760,8 @@ Those build tools also stamp each release with a
 `z-build_tools_version-<version>.ignore` marker naming the toolchain that cut
 it. Nothing downstream reads it — the Community Bundle builds from the tagged
 source, `circup` wants the zips and the json — so a last step in the workflow
-deletes it and the release page stays clean. Releases before 1.5.0 still carry
-theirs.
+deletes it and the release page stays clean. The earlier releases have had
+theirs removed by hand.
 
 Releases reach `circup` users through the
 [Community Bundle](https://github.com/adafruit/CircuitPython_Community_Bundle),
