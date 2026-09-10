@@ -47,22 +47,28 @@ Type 2 (NTAG/Ultralight) 04:8c:e8:12:34:56:80
 
 ## Install
 
-With [circup](https://github.com/adafruit/circup), which fetches the compiled
-build from this repo's latest release:
+This library is in the
+[CircuitPython Community Bundle](https://github.com/adafruit/CircuitPython_Community_Bundle),
+which [circup](https://github.com/adafruit/circup) reads by default, so
+installing it is one command with nothing to add first:
 
 ```bash
-circup bundle-add TheFilipcom4607/circuitpython-pn7150   # one time
 circup install pn7150
 ```
 
-Or by hand — download `circuitpython-pn7150-<major>.x-mpy-<version>.zip` from
-[the latest release](https://github.com/TheFilipcom4607/circuitpython-pn7150/releases/latest),
-matching the zip's major version to the CircuitPython on your board, and copy
-`lib/pn7150.mpy` out of it:
+Or by hand — every release attaches a bare
+[`pn7150.mpy`](https://github.com/TheFilipcom4607/circuitpython-pn7150/releases/latest).
+Download it and drop it in `lib/`:
 
 ```bash
 cp pn7150.mpy /Volumes/CIRCUITPY/lib/
 ```
+
+That file is built for CircuitPython 9.x and 10.x alike, which currently emit
+the same `.mpy` format. The release also carries the per-version bundle zips
+`circuitpython-pn7150-9.x-mpy-<version>.zip` and `-10.x-`, which is what
+`circup` pulls; take one of those if a future CircuitPython splits the formats
+and the bare file stops matching your board.
 
 Copying `pn7150.py` from this repo instead works and is the easiest thing to
 edit in place, but prefer the `.mpy` on a RAM-tight board: the source is 141 kB
@@ -73,6 +79,10 @@ decides whether the driver and a large `code.py` fit together.
 Either way there are no dependencies — it imports only core modules (`busio`,
 `digitalio`, `supervisor`, `micropython`, `time`). Compiled builds are published
 for CircuitPython 9.x and 10.x; the source runs on either.
+
+`circup bundle-add TheFilipcom4607/circuitpython-pn7150` still works and points
+`circup` straight at this repo's releases, which is how to get a version before
+it reaches the bundle.
 
 ### Examples
 
@@ -726,23 +736,37 @@ as a version), then publish a GitHub release for that tag. The tag alone does
 nothing; the workflow fires on the release being *published*:
 
 ```bash
-git tag 1.3.0 && git push origin 1.3.0
+git tag 1.5.0 && git push origin 1.5.0
 ```
 
 The workflow then attaches six assets:
 
 ```
-circuitpython-pn7150-py-1.3.0.zip           source, lib/pn7150.py
-circuitpython-pn7150-9.x-mpy-1.3.0.zip      compiled for CircuitPython 9.x
-circuitpython-pn7150-10.x-mpy-1.3.0.zip     compiled for CircuitPython 10.x
-circuitpython-pn7150-examples-1.3.0.zip     examples/
-circuitpython-pn7150-1.3.0.json             bundle metadata for circup
-z-build_tools_version-1.20.1.ignore         which build-tools cut the release
+pn7150.mpy                                  the module on its own, to drop in lib/
+circuitpython-pn7150-py-1.5.0.zip           source, lib/pn7150.py
+circuitpython-pn7150-9.x-mpy-1.5.0.zip      compiled for CircuitPython 9.x
+circuitpython-pn7150-10.x-mpy-1.5.0.zip     compiled for CircuitPython 10.x
+circuitpython-pn7150-examples-1.5.0.zip     examples/
+circuitpython-pn7150-1.5.0.json             bundle metadata for circup
 ```
 
-Those names are what `circup bundle-add TheFilipcom4607/circuitpython-pn7150`
-expects, and they are derived from the repository name — renaming the repo
-breaks `circup` until the next release.
+The bare `pn7150.mpy` is this repo's own addition, for people installing by
+hand; the zips and the json come from Adafruit's build tools. Their names are
+what `circup bundle-add TheFilipcom4607/circuitpython-pn7150` expects, and they
+are derived from the repository name — renaming the repo breaks that path until
+the next release.
+
+Those build tools also stamp each release with a
+`z-build_tools_version-<version>.ignore` marker naming the toolchain that cut
+it. Nothing downstream reads it — the Community Bundle builds from the tagged
+source, `circup` wants the zips and the json — so a last step in the workflow
+deletes it and the release page stays clean. Releases before 1.5.0 still carry
+theirs.
+
+Releases reach `circup` users through the
+[Community Bundle](https://github.com/adafruit/CircuitPython_Community_Bundle),
+which carries this library as a submodule and rebuilds nightly, so a new tag
+shows up in `circup install pn7150` a day later without anything to do here.
 
 `requirements.txt` must exist at the repo root even though the driver has no
 dependencies — Adafruit's `actions-ci/install.sh` runs `pip install -r
